@@ -1,0 +1,39 @@
+# gtrsnipe documentation
+
+A map of everything under `docs/`, by who it's for.
+
+## Using gtrsnipe
+
+- [`../README.md`](../README.md): installation, the CLI reference, and short examples.
+- [`wiki/`](wiki/): a snapshot of the GitHub wiki: the mapper's tunables and worked
+  examples (Mr Crowley, the Bach Cello Suite Prelude, Asturias, Barney Miller).
+- [`app/homograph-examples/`](app/homograph-examples/): `--homograph` worked examples: shared tabs for public-domain tunes.
+- [`research/results/aswritten/`](research/results/aswritten/): the wiki's tabs, the inputs to R05 and the reference fingerings of M01–M08.
+- [`../CHANGELOG.md`](../CHANGELOG.md): what changed in each release, and why.
+
+## How gtrsnipe works: [`app/`](app/)
+
+| doc | what it covers |
+|---|---|
+| [`DESIGN-viterbi-mapper.md`](app/DESIGN-viterbi-mapper.md) | The fretboard mapper as dynamic programming over a trellis (v0.3.0), replacing the greedy per-chord choice (still available with `--optimizer greedy`). |
+| [`DESIGN-unified-io.md`](app/DESIGN-unified-io.md) | Renderer × sink × schedule: one pipeline for files and the interactive player; the event-driven transport (v0.5.0), note lengths (v0.6.8). |
+| [`DESIGN-homograph.md`](app/DESIGN-homograph.md) | `--homograph`: the eligibility theorem, the solver's modes, string physics, playability, alignment and re-rhythm. |
+| [`DESIGN-tab-rhythm.md`](app/DESIGN-tab-rhythm.md) | Rhythm in a tab (v0.8.0): the dash-count layout, where the number of dashes after a note names its length; the `columns` and `loose` layouts, note-length letters, and what the reader trusts. With the history of the idea. |
+
+## The research: [`research/`](research/)
+
+The tab-homograph research: theory and proofs, the literature survey, the experiments, and
+the story of how it happened. Start at [`research/README.md`](research/README.md).
+
+## Process: [`dev/`](dev/)
+
+- [`BACKLOG.md`](dev/BACKLOG.md): the single list of open work, and The Dull Protocol for
+  working through it.
+- [`PARKING-LOT.md`](dev/PARKING-LOT.md): new ideas waiting for triage.
+- [`NOTES-playability.md`](dev/NOTES-playability.md): design notes for the backlog's
+  playability items (M01–M07), carried over from the parking lot.
+
+The images in this folder (`gtrsnipe-*.png`) are logo assets.
+The v0.3.0-era plans and audit (`docs/dev/archive/`) and the 2026-09-28 state-of-the-docs
+audit (`docs/dev/DOCS-AUDIT.md`) were retired on 2026-11-07; git history keeps them, last at
+tag v0.8.1 (`git show v0.8.1:docs/dev/DOCS-AUDIT.md`).

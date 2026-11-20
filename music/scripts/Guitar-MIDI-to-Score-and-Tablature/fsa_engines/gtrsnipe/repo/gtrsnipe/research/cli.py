@@ -1,0 +1,667 @@
+"""``gtrsnipe-research``: corpus caches, offset profiles, and the mapper studies (M01–M03).
+
+    gtrsnipe-research corpus list
+    gtrsnipe-research [--data DIR] corpus build essen
+    gtrsnipe-research corpus info essen
+    gtrsnipe-research corpus show essen:deut4659
+    gtrsnipe-research profile essen:deut4659#p1 essen:deut4659#p3 --subdivide 2
+    gtrsnipe-research profile a.mid:2@1-4 "C4 D4 E4 C4" --rhythm sequence
+    gtrsnipe-research families mtc-ann
+    gtrsnipe-research segments mtc-ann --level phrase --scope family
+    gtrsnipe-research scan essen mtc-fs --solve 50 --tabs out/
+    gtrsnipe-research aswritten song.tab --corpora essen mtc-fs lakh-clean
+    gtrsnipe-research sweep crowley.mid:5 asturias.tab --probes --sample nottingham:20
+    gtrsnipe-research optimizers --sample nottingham:100 essen:100 --json m02.json
+    gtrsnipe-research difficulty song.tab crowley.mid:5 --probes --both -v
+    gtrsnipe-research score editor.tab --bars 23-24 --prefer-open --sweet-spot-high 4
+
+A song is a corpus reference (``NAME:ID``, optionally ``@START-END`` in notes,
+1-based inclusive, or ``#pN`` for phrase N), or anything ``--homograph`` reads:
+a .mid[:TRACK]/.abc/.tab/.vex file with an optional ``@START-END`` onset window,
+or an inline melody.
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import os
+import re
+import statistics
+import sys
+from collections import Counter
+from typing import Dict, List, Optional, Tuple
+
+from . import corpus as C
+from .offsets import format_profile, profile_json, profile_songs
+
+_loaded: Dict[str, List[C.Melody]] = {}
+
+
+def _cache_path(name: str, data: Optional[str]) -> str:
+    if os.path.exists(name) and name.endswith(".gz"):
+        return name
+    if name not in C.CORPORA:
+        raise ValueError(f"unknown corpus {name!r} (known: {', '.join(C.CORPORA)})")
+    path = C.default_cache(name, data)
+    if not os.path.exists(path):
+        raise ValueError(f"no cache for {name} yet: run  gtrsnipe-research corpus build {name}")
+    return path
+
+
+def _melodies(name: str, data: Optional[str]) -> List[C.Melody]:
+    path = _cache_path(name, data)
+    if path not in _loaded:
+        _loaded[path] = C.read_cache(path)[1]
+    return _loaded[path]
+
+
+_REF = re.compile(r"^(?P<corpus>[a-z0-9-]+):(?P<id>.+?)(?:@(?P<s>\d+)-(?P<e>\d+)|#p(?P<p>\d+))?$")
+
+
+def resolve_melody(ref: str, data: Optional[str]) -> Optional[C.Melody]:
+    """A corpus reference as a Melody, or None if ``ref`` isn't one."""
+    m = _REF.match(ref)
+    if not m or m.group("corpus") not in C.CORPORA or os.path.exists(ref):
+        return None
+    mel = C.find(_melodies(m.group("corpus"), data), m.group("id"))
+    if m.group("s"):
+        return mel.slice(int(m.group("s")) - 1, int(m.group("e")))
+    if m.group("p"):
+        spans = mel.phrase_spans()
+        k = int(m.group("p"))
+        if not 1 <= k <= len(spans):
+            raise ValueError(f"{mel.ref} has {len(spans)} phrase(s); no phrase {k}")
+        out = mel.slice(*spans[k - 1])
+        out.id = f"{mel.id}#p{k}"
+        return out
+    return mel
+
+
+def load_song(spec: str, data: Optional[str]):
+    """(Song, label) for a corpus reference, file or inline melody."""
+    mel = resolve_melody(spec, data)
+    if mel is not None:
+        return mel.to_song(), mel.ref
+    from ..arguments import setup_parser
+    from ..converter import _load_homograph_song
+    args = setup_parser().parse_args([])
+    song, title, _ = _load_homograph_song(spec, args, anchor_open=[])
+    return song, title
+
+
+# -- commands ---------------------------------------------------------------------
+
+def cmd_corpus_list(a) -> int:
+    for name, spec in C.CORPORA.items():
+        try:
+            path = C.default_cache(name, a.data)
+            state = "cached" if os.path.exists(path) else "not built"
+        except ValueError:
+            state = "no corpus root"
+        print(f"{name:12} {state:10} {spec.about}")
+    return 0
+
+
+def cmd_corpus_build(a) -> int:
+    def progress(i, n):
+        if i == n or i % max(1, n // 20) == 0:
+            print(f"\r  {i}/{n} files", end="", file=sys.stderr, flush=True)
+    h = C.build(a.name, root=a.data, out=a.out, workers=a.workers, limit=a.limit,
+                progress=progress)
+    print(file=sys.stderr)
+    print(f"{a.name}: {h['melodies']} melodies from {h['files']} files, {h['errors']} errors"
+          f" -> {a.out or C.default_cache(a.name, a.data)}")
+    for rel, err in h["error_sample"][:10]:
+        print(f"  {rel}: {err}")
+    return 0
+
+
+def cmd_corpus_info(a) -> int:
+    path = _cache_path(a.name, a.data)
+    head = C.cache_header(path)
+    lengths, sources, meters, phrases, dropped = [], Counter(), Counter(), 0, 0
+    for m in C.iter_cache(path):
+        lengths.append(len(m))
+        sources[m.source.split(" ")[0] if m.source.startswith("midi:track") else m.source] += 1
+        meters[m.meter or "?"] += 1
+        phrases += bool(m.phrases)
+        dropped += m.dropped
+    print(f"{head['corpus']}: {head['about']}")
+    print(f"  built {head['built']} with gtrsnipe {head['gtrsnipe']}; {head['files']} files, "
+          f"{head['errors']} unreadable")
+    if not lengths:
+        print("  (no melodies)")
+        return 0
+    q = statistics.quantiles(lengths, n=4) if len(lengths) > 1 else [lengths[0]] * 3
+    print(f"  {len(lengths)} melodies, {sum(lengths):,} notes; notes per melody median "
+          f"{statistics.median(lengths):g} (IQR {q[0]:g}-{q[2]:g}, min {min(lengths)}, "
+          f"max {max(lengths)})")
+    print("  line from: " + ", ".join(f"{k} {v}" for k, v in sources.most_common()))
+    print("  meters: " + ", ".join(f"{k} {v}" for k, v in meters.most_common(8)))
+    print(f"  phrase-marked: {phrases}; simultaneous notes dropped: {dropped:,}")
+    return 0
+
+
+def cmd_corpus_show(a) -> int:
+    from ..core.theory import pitch_to_note_name
+    mel = resolve_melody(a.ref, a.data)
+    if mel is None:
+        raise ValueError(f"{a.ref!r} is not a corpus reference (NAME:ID)")
+    print(f"{mel.ref}  {mel.title!r}" + (f" by {mel.artist}" if mel.artist else ""))
+    print(f"  {len(mel)} notes, meter {mel.meter or '?'}, key {mel.key or '?'}, "
+          f"from {mel.source}; phrases {len(mel.phrase_spans())}")
+    starts = set(mel.phrases)
+    toks = []
+    for i, (p, t, d) in enumerate(zip(mel.pitches, mel.onsets, mel.durations)):
+        dur = d / C.TPQ
+        toks.append(("| " if i in starts and i else "") + pitch_to_note_name(p)
+                    + ("" if dur == 1 else f":{dur:g}"))
+    print("  " + " ".join(toks))
+    return 0
+
+
+def cmd_profile(a) -> int:
+    (sa, la), (sb, lb) = load_song(a.a, a.data), load_song(a.b, a.data)
+    rhythm = a.rhythm if a.rhythm in ("strict", "sequence") else float(a.rhythm)
+    prof, why = profile_songs(sa, sb, rhythm=rhythm, subdivide=a.subdivide)
+    if prof is None:
+        why = why.replace("--homograph-subdivide", "--subdivide").replace("--homograph-rhythm", "--rhythm")
+        print(f"{la} and {lb} don't align: {why}", file=sys.stderr)
+        return 1
+    if a.json:
+        print(profile_json(prof, a=la, b=lb))
+    else:
+        print(f"A = {la}\nB = {lb}")
+        print(format_profile(prof))
+    return 0
+
+
+def cmd_families(a) -> int:
+    from .families import format_results, results_json, run
+    path = _cache_path(a.name, a.data)
+    head, mels = C.read_cache(path)
+    if not any(m.family for m in mels):
+        raise ValueError(f"{a.name} has no tune-family labels (try mtc-ann or mtc-fs)")
+    res = run(mels, grid=a.grid, bootstrap=a.bootstrap, seed=a.seed,
+              max_queries=a.queries, models=not a.no_models)
+    res["corpus"] = head["corpus"]
+    print(format_results(res, head["corpus"]))
+    if a.json:
+        with open(a.json, "w") as f:
+            f.write(results_json(res))
+    return 0
+
+
+def cmd_segments(a) -> int:
+    import json
+    from . import segments as SG
+    head, mels = C.read_cache(_cache_path(a.name, a.data))
+    md = a.metadata or os.path.join(C.corpus_root(a.data), "mtc", "MTC-ANN-2.0.1", "metadata")
+    if a.level == "phrase":
+        segs, keys = SG.load_phrases(mels, md), ["ann1", "ann2", "ann3"]
+    else:
+        segs, keys = SG.load_motifs(mels, md), ["motif"]
+    if not segs:
+        raise ValueError(f"no {a.level} annotations found (metadata: {md})")
+    grid = a.grid or (16 if a.level == "phrase" else 8)
+    feats = SG.features(segs, scope=a.scope, grid=grid, workers=a.workers)
+    out = {"corpus": head["corpus"], "level": a.level, "scope": a.scope, "results": []}
+    for key in keys:
+        res = SG.run(segs, key, feats, scope=a.scope, grid=grid, bootstrap=a.bootstrap,
+                     seed=a.seed, models=not a.no_models)
+        out["results"].append(res)
+        print(SG.format_results(res, f"{head['corpus']} {a.level}s, labels {key}, {a.scope} scope"))
+        print()
+    if a.json:
+        with open(a.json, "w") as f:
+            json.dump(out, f, indent=1)
+    return 0
+
+
+def cmd_scan(a) -> int:
+    import json
+    from . import scan as S
+    mels, names = [], []
+    for name in a.names:
+        head, ms = C.read_cache(_cache_path(name, a.data))
+        if a.named_melodies:                 # drop MIDI lines taken from the skyline
+            ms = [m for m in ms if m.source != "midi:skyline"]
+        mels += ms
+        names.append(head["corpus"])
+    by_ref = {m.ref: m for m in mels}
+    stats, top, samples = S.scan(mels, unit=a.unit, max_richness=a.max_richness,
+                                 min_len=a.min_len, max_len=a.max_len, window=a.window,
+                                 stride=a.stride, keep=a.keep, min_keep_len=a.min_keep_len,
+                                 sample_per_length=a.physics_sample,
+                                 cross_corpus=a.cross_corpus, seed=a.seed)
+    print(S.format_stats(stats, " + ".join(names)))
+    lim = dict(max_fret=a.max_fret, max_discomfort=a.max_discomfort)
+    for c in top[:a.solve]:
+        c.solved = S.solve(c, by_ref, **lim)
+    physics = {}
+    for L, cs in samples.items():
+        for c in cs:
+            c.solved = S.solve(c, by_ref, **lim)
+        physics[L] = {"sampled": len(cs),
+                      "free": sum(bool(c.solved["free"]) for c in cs),
+                      "anchored": sum(bool(c.solved["anchored"]) for c in cs),
+                      "anchored_no_regauge": sum(bool(c.solved["anchored"])
+                                                 and not c.solved["anchored"]["regauges"]
+                                                 for c in cs),
+                      "middle": sum(bool(c.solved["middle"]) for c in cs),
+                      "middle_no_regauge": sum(bool(c.solved["middle"])
+                                               and not c.solved["middle"]["regauges"] for c in cs)}
+    if physics:
+        print("\nPhysical check of random unrelated-sounding eligible pairs (share solved):")
+        print("  notes  sampled   anchored (no restring)   middle (no restring)")
+        for L, v in physics.items():
+            n = max(1, v["sampled"])
+            print(f"  {L:5d}  {v['sampled']:7d}   {100 * v['anchored'] / n:5.1f}% "
+                  f"({100 * v['anchored_no_regauge'] / n:5.1f}%)        "
+                  f"{100 * v['middle'] / n:5.1f}% ({100 * v['middle_no_regauge'] / n:5.1f}%)")
+    print(f"\nBest unrelated-sounding pairs: most distinct (A,B) pitch pairs, then longest"
+          f" (one per pair of works; solver run on the first {min(a.solve, len(top))}):")
+    print(S.format_candidates(top, a.show))
+    if a.tabs:
+        os.makedirs(a.tabs, exist_ok=True)
+        written = 0
+        for k, c in enumerate(top[:a.solve], 1):
+            if not (c.solved and c.solved.get("anchored")):
+                continue
+            text = S.render(c, by_ref, **lim)
+            if text:
+                fn = os.path.join(a.tabs, f"{k:03d}-{c.pairs}pairs-{c.length}notes.tab")
+                with open(fn, "w") as f:
+                    f.write(text + "\n")
+                written += 1
+        print(f"\n{written} verified shared tabs written to {a.tabs}")
+    if a.json:
+        with open(a.json, "w") as f:
+            json.dump({"corpora": names, "stats": S.stats_dict(stats),
+                       "physics": {str(k): v for k, v in physics.items()},
+                       "top": [vars(c) for c in top],
+                       "samples": {str(L): [vars(c) for c in cs] for L, cs in samples.items()},
+                       "settings": {k: v for k, v in vars(a).items() if k != "func"}},
+                      f, indent=1, default=str)
+    return 0
+
+
+def cmd_aswritten(a) -> int:
+    import json
+    from . import aswritten as W
+    mels, names = [], []
+    for name in a.corpora:
+        head, ms = C.read_cache(_cache_path(name, a.data))
+        mels += ms
+        names.append(head["corpus"])
+    by_ref = {m.ref: m for m in mels}
+    lengths = [int(x) for x in a.lengths.split(",")]
+    report = {"corpora": names, "tabs": {}}
+    cache: dict = {}
+    for path in a.tabs:
+        tab = W.read_tab(path, os.path.basename(path))
+        res, hits = W.scan_tab(tab, mels, lengths, keep=a.keep, window_cache=cache)
+        for h in hits[:a.solve]:
+            h.solved = W.solve_hit(tab, h, by_ref)
+        print(f"\n{tab.name}: {len(tab.pitches)} notes on "
+              f"{len(set(tab.strings.tolist()))} strings; {int(tab.chord_at.sum())} chord onsets skipped")
+        print("  notes  windows   compared   share *some* tab   as written (per million)"
+              "   trivial   non-trivial (per million)   unrelated   itself")
+        for L, r in res.items():
+            if not r.windows:
+                continue
+            c = max(1, r.candidates)
+            nt = r.as_written - r.trivial
+            print(f"  {L:5d}  {r.windows:7d}  {r.candidates:10d}   {100 * r.free / c:14.2f}%"
+                  f"   {r.as_written:9d} ({1e6 * r.as_written / c:8.2f})   {r.trivial:7d}"
+                  f"   {nt:9d} ({1e6 * nt / c:8.2f})      {r.unrelated:6d}   {r.itself:6d}")
+        found = sorted({x for r in res.values() for x in r.itself_found})
+        if found:
+            print("  the passage itself (transposed) turns up in: " + "; ".join(found[:8])
+                  + (" ..." if len(found) > 8 else ""))
+        if hits:
+            print("  best as-written hits (unrelated-sounding first; solver on the first "
+                  f"{min(a.solve, len(hits))}):")
+            print("    tab notes   pairs rich str   C1  contour mech  solver        corpus passage")
+            for h in hits[:a.show]:
+                sv = h.solved
+                mark = "?" if sv is None else ("ok" + (f"+{sv['regauges']}g" if sv.get("regauges")
+                                                        else "") if sv["as_written"] else "-")
+                print(f"    {h.tab_span[0]:3d}-{h.tab_span[1]:<3d}   {h.pairs:5d} {h.richness:4d} "
+                      f"{h.strings:3d}  {h.c1:4.2f}  {h.contour:5.2f}  {'y' if h.mechanical else 'n':>3}"
+                      f"   {mark:10}  {h.ref} ({h.title})")
+        report["tabs"][tab.name] = {"results": {str(L): vars(r) for L, r in res.items()},
+                                    "hits": [vars(h) for h in hits]}
+    if a.json:
+        with open(a.json, "w") as f:
+            json.dump(report, f, indent=1, default=str)
+    return 0
+
+
+def _song_inputs(a, what: str):
+    """(label, Song) pairs from positional songs, --probes and --sample CORPUS:N."""
+    import random
+    from . import sweep as SW
+    inputs = []
+    if a.probes:
+        inputs += SW.probes()
+    for spec in a.songs:
+        inputs.append((spec, load_song(spec, a.data)[0]))
+    for spec in a.sample or []:
+        name, _, n = spec.partition(":")
+        mels = _melodies(name, a.data)
+        rng = random.Random(a.seed)
+        for m in rng.sample(mels, min(int(n or 10), len(mels))):
+            inputs.append((m.ref, m.to_song()))
+    if not inputs:
+        raise ValueError(f"nothing to {what}: give songs, --probes or --sample CORPUS:N")
+    return inputs
+
+
+def cmd_optimizers(a) -> int:
+    """M02: Viterbi vs greedy on the same inputs, under the one objective."""
+    import json
+    from . import sweep as SW
+    pairs = []
+    for label, song in _song_inputs(a, "compare"):
+        p = SW.compare_optimizers(song, label)
+        pairs.append(p)
+        if a.verbose:
+            print(f"  {label:40s} gain/note {p.gain_per_note:6.3f}  travel {p.greedy.travel:.2f}->{p.viterbi.travel:.2f}"
+                  f"  jumps {p.greedy.jumps}->{p.viterbi.jumps}  switches {p.greedy.switches}->{p.viterbi.switches}"
+                  f"  secs {p.seconds[1]:.2f}->{p.seconds[0]:.2f}", flush=True)
+    print(SW.format_optimizers(pairs))
+    if a.json:
+        with open(a.json, "w") as f:
+            json.dump({"summary": SW.summarize_optimizers(pairs), "pairs": [p.to_dict() for p in pairs]}, f, indent=1)
+    return 0
+
+
+def cmd_sweep(a) -> int:
+    import json
+    from . import sweep as SW
+    inputs = _song_inputs(a, "sweep")
+    knobs = a.knobs.split(",") if a.knobs else None
+    for k in knobs or []:
+        if k not in SW.KNOBS:
+            raise ValueError(f"unknown knob {k!r} (known: {', '.join(SW.KNOBS)})")
+    pairs = []
+    for spec in a.pair or []:
+        x, _, y = spec.partition(",")
+        if x not in SW.KNOBS or y not in SW.KNOBS or x == y:
+            raise ValueError(f"--pair wants two different knob names, got {spec!r}")
+        pairs.append((x, y))
+    if pairs:
+        report = {"pairs": []}
+        for label, song in inputs:
+            for x, y in pairs:
+                pr = SW.sweep_pair(song, label, x, y)
+                print(SW.format_pair(pr))
+                report["pairs"].append(pr.to_dict())
+        if a.json:
+            with open(a.json, "w") as f:
+                json.dump(report, f, indent=1, default=str)
+        return 0
+    results = []
+    for label, song in inputs:
+        r = SW.sweep_song(song, label, knobs=knobs, check_scale=not a.no_scale_check)
+        results.append(r)
+        if a.verbose:
+            print(SW.format_song(r))
+            print()
+        if a.tabs:
+            _write_sweep_tabs(a.tabs, label, song, r)
+    summ = SW.summarize(results)
+    print(SW.format_summary(summ, results))
+    if a.json:
+        with open(a.json, "w") as f:
+            json.dump({"summary": [vars(s) for s in summ],
+                       "songs": [r.to_dict() for r in results]}, f, indent=1, default=str)
+    return 0
+
+
+def _write_sweep_tabs(folder: str, label: str, song, r) -> None:
+    """One ASCII tab per distinct fingering a knob produced, for listening/reading."""
+    from ..core.config import MapperConfig
+    from ..formats.tab.generator.ascii import AsciiTabGenerator
+    from . import sweep as SW
+    safe = re.sub(r"[^A-Za-z0-9_.@-]+", "_", label)
+    os.makedirs(folder, exist_ok=True)
+    seen = {}
+    for name, kr in r.knobs.items():
+        for v, run in zip(kr.values, kr.runs):
+            if run.signature in seen:
+                continue
+            seen[run.signature] = (name, v)
+            cfg = SW.configured(MapperConfig(), **SW.KNOBS[name].settings(v))
+            text = AsciiTabGenerator.generate(copy.deepcopy(song), command_line=f"sweep {name}={v}",
+                                              no_articulations=True, mapper_config=cfg)
+            tag = "default" if run.signature == r.base.signature else f"{name}={v}"
+            with open(os.path.join(folder, f"{safe}.{tag}.tab"), "w") as f:
+                f.write(text)
+
+
+def cmd_difficulty(a) -> int:
+    """M03: per-onset difficulty descriptors and a profile per tab (M08: both time bases)."""
+    import json
+    from . import difficulty as D
+    inputs = _song_inputs(a, "profile")
+    profiles = []
+    for label, song in inputs:
+        bases = D.TIME_BASES if a.both else (a.time_base,)
+        for tb in bases:
+            p = D.profile(song, label, time_base=tb, min_gap=a.min_gap, refinger=a.refinger, reach=a.reach)
+            profiles.append(p)
+            if a.verbose:
+                fingered = song if (p.fingering == "as written") else D.finger_song(song)
+                print(f"== {label} ({p.fingering}, time base {tb})")
+                print(D.format_onsets(D.onsets(fingered, time_base=tb, min_gap=a.min_gap, reach=a.reach)))
+                print()
+    print(D.format_profiles(profiles))
+    if a.json:
+        with open(a.json, "w") as f:
+            json.dump([p.to_dict() for p in profiles], f, indent=1, default=str)
+    return 0
+
+
+def cmd_score(a) -> int:
+    """Score a tab's fingering bar by bar with the mapper's features x weights, beside the
+    mapper's own fingering of the same notes under the same knobs."""
+    import json
+    from . import score as S
+    from ..arguments import build_mapper_config, resolve_num_strings
+    lo, hi = S.parse_bars(a.bars)
+    cfg = build_mapper_config(a, tuning=a.tuning, num_strings=resolve_num_strings(a.tuning, a.num_strings))
+    report = []
+    for spec in a.songs:
+        song, label = load_song(spec, a.data)
+        paths = []
+        if S.fingered(song):
+            paths.append(S.score_path(song, cfg, label))
+        elif a.no_mapper:
+            raise ValueError(f"{spec} carries no fingering to score (give a .tab, or drop --no-mapper)")
+        if not a.no_mapper:
+            paths.append(S.mapper_path(song, cfg, "gtrsnipe"))
+        if len(a.songs) > 1:
+            print(f"### {label}")
+        print(S.format_report(paths, cfg, lo, hi, detail=a.verbose or a.bars is not None))
+        print()
+        report.append({"song": label, "bars": [lo, hi], "paths": [p.to_dict() for p in paths]})
+    if a.json:
+        with open(a.json, "w") as f:
+            json.dump(report, f, indent=1, default=str)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="gtrsnipe-research", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--data", help=f"corpus root folder (default: ${C.ROOT_ENV})")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    cp = sub.add_parser("corpus", help="build and inspect melody caches").add_subparsers(
+        dest="corpus_cmd", required=True)
+    cp.add_parser("list", help="known corpora and whether they are cached").set_defaults(
+        func=cmd_corpus_list)
+    b = cp.add_parser("build", help="read a corpus into its cache")
+    b.add_argument("name", choices=list(C.CORPORA))
+    b.add_argument("--out", help="cache file (default: DATA/_cache/NAME.jsonl.gz)")
+    b.add_argument("--workers", type=int, help="processes (default: CPUs - 2)")
+    b.add_argument("--limit", type=int, help="read only the first N files")
+    b.set_defaults(func=cmd_corpus_build)
+    i = cp.add_parser("info", help="summary of a cached corpus")
+    i.add_argument("name", help="corpus name or cache file")
+    i.set_defaults(func=cmd_corpus_info)
+    s = cp.add_parser("show", help="print one melody")
+    s.add_argument("ref", help="NAME:ID, e.g. essen:deut4659 or essen:deut4659#p2")
+    s.set_defaults(func=cmd_corpus_show)
+
+    p = sub.add_parser("profile", help="offset profile of two aligned melodies")
+    p.add_argument("a")
+    p.add_argument("b")
+    p.add_argument("--rhythm", default="strict",
+                   help="strict (default), a slop RATIO such as 1.5, or sequence")
+    p.add_argument("--subdivide", type=int, default=1,
+                   help="let one note stand for up to K notes of the other song")
+    p.add_argument("--json", action="store_true", help="one JSON object")
+    p.set_defaults(func=cmd_profile)
+
+    fm = sub.add_parser("families", help="tune-family retrieval with each offset measure (R03)")
+    fm.add_argument("name", help="a corpus with tune-family labels (mtc-ann, mtc-fs) or cache file")
+    fm.add_argument("--grid", type=int, default=64, help="points per melody (default 64)")
+    fm.add_argument("--bootstrap", type=int, default=2000, help="resamples for the 95%% intervals")
+    fm.add_argument("--seed", type=int, default=20260926)
+    fm.add_argument("--queries", type=int, help="use a random sample of N queries")
+    fm.add_argument("--no-models", action="store_true", help="skip the logistic pair models")
+    fm.add_argument("--json", help="also write the full results here")
+    fm.set_defaults(func=cmd_families)
+
+    sg = sub.add_parser("segments", help="phrase- and motif-level retrieval on MTC-ANN's "
+                                         "annotations (the R03 follow-ups)")
+    sg.add_argument("name", nargs="?", default="mtc-ann", help="the MTC-ANN cache (default mtc-ann)")
+    sg.add_argument("--level", choices=["phrase", "motif"], default="phrase")
+    sg.add_argument("--scope", choices=["family", "song"], default="family",
+                    help="candidates: other songs of the tune family, or the same song")
+    sg.add_argument("--metadata", help="MTC-ANN metadata folder (default: under --data)")
+    sg.add_argument("--grid", type=int, help="grid points per segment (default 16 phrases, 8 motifs)")
+    sg.add_argument("--bootstrap", type=int, default=2000)
+    sg.add_argument("--seed", type=int, default=20260930)
+    sg.add_argument("--workers", type=int, default=1, help="processes for the pair features")
+    sg.add_argument("--no-models", action="store_true", help="skip the logistic pair models")
+    sg.add_argument("--json", help="also write the full results here")
+    sg.set_defaults(func=cmd_segments)
+
+    sc = sub.add_parser("scan", help="find passages of different songs that could share one tab (R04)")
+    sc.add_argument("names", nargs="+", help="corpora (or cache files) to scan together")
+    sc.add_argument("--unit", choices=["auto", "phrase", "window"], default="auto",
+                    help="marked phrases, sliding windows, or phrases where marked (default)")
+    sc.add_argument("--window", type=int, default=16, help="window length in notes (default 16)")
+    sc.add_argument("--stride", type=int, default=4, help="window step in notes (default 4)")
+    sc.add_argument("--min-len", type=int, default=5, help="shortest phrase (default 5 notes)")
+    sc.add_argument("--max-len", type=int, default=64, help="longest phrase (default 64)")
+    sc.add_argument("--max-richness", type=int, default=6, help="string budget (default 6)")
+    sc.add_argument("--keep", type=int, default=300, help="candidates kept (default 300)")
+    sc.add_argument("--min-keep-len", type=int, default=8,
+                    help="shortest passage kept as a candidate (default 8)")
+    sc.add_argument("--solve", type=int, default=25,
+                    help="run the homograph solver on the best N candidates (default 25)")
+    sc.add_argument("--physics-sample", type=int, default=0,
+                    help="also solve N random different-sounding eligible pairs per length")
+    sc.add_argument("--show", type=int, default=25, help="candidates listed (default 25)")
+    sc.add_argument("--tabs", help="write the verified shared tabs of solved candidates here")
+    sc.add_argument("--max-fret", type=int, default=24,
+                    help="highest fret the solver may use (default 24)")
+    sc.add_argument("--max-discomfort", type=float, default=None, metavar="POINTS",
+                    help="reject shared tabs more than POINTS mapper points per note below "
+                         "A's own best tab (see --homograph-max-discomfort)")
+    sc.add_argument("--cross-corpus", action="store_true",
+                    help="only pair passages from different corpora")
+    sc.add_argument("--named-melodies", action="store_true",
+                    help="MIDI corpora: only melodies from a melody-named track (no skyline)")
+    sc.add_argument("--seed", type=int, default=20260926)
+    sc.add_argument("--json", help="also write stats, candidates and samples here")
+    sc.set_defaults(func=cmd_scan)
+
+    aw = sub.add_parser("aswritten", help="can a tab's own fingering be retuned into other songs? (R05)")
+    aw.add_argument("tabs", nargs="+", help="ASCII tab files (their // Tuning: header, else STANDARD)")
+    aw.add_argument("--corpora", nargs="+", default=["essen", "mtc-fs", "nottingham", "pop909",
+                                                     "lakh-clean"],
+                    help="corpora to search (default: all cached except lakh-full)")
+    aw.add_argument("--lengths", default="8,12,16,24,32",
+                    help="window lengths in notes (default 8,12,16,24,32)")
+    aw.add_argument("--keep", type=int, default=30, help="hits kept per tab (default 30)")
+    aw.add_argument("--solve", type=int, default=10, help="hits checked by the solver (default 10)")
+    aw.add_argument("--show", type=int, default=15, help="hits listed per tab (default 15)")
+    aw.add_argument("--json", help="also write the results here")
+    aw.set_defaults(func=cmd_aswritten)
+
+    sw = sub.add_parser("sweep", help="vary one mapper knob at a time; count distinct tabs (M01)")
+    sw.add_argument("songs", nargs="*", help="songs to finger (files, corpus refs, inline)")
+    sw.add_argument("--probes", action="store_true", help="include the built-in probe passages")
+    sw.add_argument("--sample", nargs="+", metavar="CORPUS:N", help="N random tunes of a cached corpus")
+    sw.add_argument("--seed", type=int, default=1)
+    sw.add_argument("--knobs", help="comma-separated knob names (default: all)")
+    sw.add_argument("--pair", action="append", metavar="A,B",
+                    help="ablation: grid over two knobs; distinct tabs of B at each A (repeatable)")
+    sw.add_argument("--no-scale-check", action="store_true")
+    sw.add_argument("--tabs", metavar="DIR", help="write every distinct tab here")
+    sw.add_argument("--json", help="also write the results here")
+    sw.add_argument("-v", "--verbose", action="store_true", help="per-song detail")
+    sw.set_defaults(func=cmd_sweep)
+
+    op = sub.add_parser("optimizers", help="Viterbi vs greedy on the same inputs, one objective (M02)")
+    op.add_argument("songs", nargs="*", help="songs to finger (files, corpus refs, inline)")
+    op.add_argument("--probes", action="store_true", help="include the built-in probe passages")
+    op.add_argument("--sample", nargs="+", metavar="CORPUS:N", help="N random tunes of a cached corpus")
+    op.add_argument("--seed", type=int, default=1)
+    op.add_argument("--json", help="also write the results here")
+    op.add_argument("-v", "--verbose", action="store_true", help="per-song detail")
+    op.set_defaults(func=cmd_optimizers)
+
+    df = sub.add_parser("difficulty", help="per-onset difficulty descriptors and a profile per tab (M03)")
+    df.add_argument("songs", nargs="*", help="tabs or songs (files, corpus refs, inline)")
+    df.add_argument("--probes", action="store_true", help="include the built-in probe passages")
+    df.add_argument("--sample", nargs="+", metavar="CORPUS:N", help="N random tunes of a cached corpus")
+    df.add_argument("--seed", type=int, default=1)
+    df.add_argument("--refinger", action="store_true", help="ignore a tab's own fingering; use the mapper's")
+    df.add_argument("--time-base", choices=("end", "onset"), default="end",
+                    help="time a hand move is charged against: end of the previous note to the next onset "
+                         "(default), or onset to onset (Hori & Sagayama)")
+    df.add_argument("--both", action="store_true", help="profile under both time bases (M08)")
+    df.add_argument("--min-gap", type=float, default=0.05, metavar="SECONDS",
+                    help="floor on the time a move can be charged against (default 0.05)")
+    df.add_argument("--reach", type=int, default=3, metavar="FRETS",
+                    help="frets above the index finger the hand covers without moving (default 3; 0 = no hand model)")
+    df.add_argument("--json", help="also write the profiles here")
+    df.add_argument("-v", "--verbose", action="store_true", help="per-onset detail")
+    df.set_defaults(func=cmd_difficulty)
+
+    from ..arguments import add_mapper_args, add_tuning_args
+    sc = sub.add_parser("score", help="score a tab's fingering bar by bar with the mapper's objective, "
+                                      "beside the mapper's own fingering of the same notes",
+                        description="Each onset of the tab, as written, is scored with the mapper's features x "
+                                    "weights under the knobs given (the same flags as gtrsnipe); the mapper's own "
+                                    "fingering of the same notes is scored beside it. --bars shows the per-onset "
+                                    "terms inside a range and the single-knob change that would make the range "
+                                    "tie. Bars count from 1 at the first bar written (--number-bars shows them).")
+    sc.add_argument("songs", nargs="+", help="tabs (their own fingering is scored) or songs (mapper only)")
+    sc.add_argument("--bars", metavar="START[-END]", help="the bars to detail, 1-based inclusive ('23', '23-24', '23-')")
+    sc.add_argument("--no-mapper", action="store_true", help="score only the tabs as written")
+    sc.add_argument("--json", help="also write every path's steps here")
+    sc.add_argument("-v", "--verbose", action="store_true", help="per-onset terms for every bar shown")
+    add_tuning_args(sc.add_argument_group("instrument"))
+    add_mapper_args(sc.add_argument_group("mapper knobs (as in gtrsnipe)"))
+    sc.set_defaults(func=cmd_score)
+    return ap
+
+
+def main(argv=None) -> int:
+    a = build_parser().parse_args(argv)
+    try:
+        return a.func(a)
+    except ValueError as e:
+        print(f"gtrsnipe-research: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

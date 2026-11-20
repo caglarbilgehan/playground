@@ -1,0 +1,1114 @@
+from .formats import abc, mid, tab, vex
+from .formats.mid.generator import MidiUtilFile
+from .core.theory import note_name_to_pitch, pitch_to_note_name, midi_to_hz
+from .core.keys import DOUBTED, FROM_FILE
+from .core.types import Song, Tuning, Track
+from .core.config import MapperConfig
+from .utils.io import save_text_file, save_midi_file
+from .arguments import setup_parser, build_mapper_config, apply_profiles, apply_key, open_string_pitches_for
+from .utils.logger import setup_logger
+from .audio.dynamic_tempo import analyze_dynamic_tempo
+from argparse import ArgumentParser
+from typing import Optional
+from pathlib import Path
+from .core.types import MusicalEvent
+import numpy as np
+import sys
+import os
+import logging
+from sys import exit
+import copy
+
+logger = logging.getLogger(__name__)
+
+SAMPLE_RATE=44100
+
+
+def _require_extra(extra: str, feature: str, *, cli: bool):
+    """Report a missing optional dependency group with an install hint.
+
+    CLI callers get a clean SystemExit (no traceback); library callers get an
+    ImportError so a consuming process isn't killed.
+    """
+    msg = (f"Feature {feature!r} needs optional dependencies that aren't installed.\n"
+           f"  Install them with:  pip install 'gtrsnipe[{extra}]'")
+    if cli:
+        logger.error(msg)
+        raise SystemExit(1)
+    raise ImportError(msg)
+
+def debug_song_state(song: Song, num_notes: int, stage: str):
+    """A helper function to print the number of notes and the first few notes at any stage."""
+    all_events = [event for track in song.tracks for event in track.events]
+    all_events.sort(key=lambda e: e.time)
+    logger.debug(f"\n--- DEBUG STATE AT: {stage} ---")
+    logger.debug(f"Total notes: {len(all_events)}")
+    if all_events:
+        logger.debug(f"First {num_notes} notes (Time, Pitch (Note), Velocity):")
+        for event in all_events[:num_notes]:
+            logger.debug(f"  T:{event.time:<7.2f} P:{event.pitch:<4}({pitch_to_note_name(event.pitch)}) V:{event.velocity}")
+    logger.debug("-----------------------------------\n")
+
+
+def filter_by_velocity(song: Song, velocity_cutoff: int) -> Song:
+    """
+    Removes all musical events from a song that are below a certain
+    MIDI velocity threshold.
+    """
+    if velocity_cutoff <= 0:
+        return song
+
+    logger.info(f"--- Filtering out notes with velocity < {velocity_cutoff} ---")
+    
+    notes_before = sum(len(track.events) for track in song.tracks)
+    
+    for track in song.tracks:
+        track.events = [event for event in track.events if event.velocity >= velocity_cutoff]
+
+    notes_after = sum(len(track.events) for track in song.tracks)
+    notes_removed = notes_before - notes_after
+    
+    if notes_removed > 0:
+        logger.info(f"Removed {notes_removed} low-velocity notes.")
+        
+    return song
+
+def pre_quantize_song(song: Song, resolution: float) -> Song:
+    """
+    Applies heavy-handed quantization to all events in a song.
+
+    This function iterates through every note and snaps its start time to the
+    nearest quantization grid line defined by the resolution.
+    """
+    logger.info(f"--- Applying pre-quantization pass with resolution: {resolution} ---")
+    notes_adjusted = 0
+    for track in song.tracks:
+        for event in track.events:
+            original_time = event.time
+            quantized_time = round(original_time / resolution) * resolution
+            if original_time != quantized_time:
+                event.time = quantized_time
+                notes_adjusted += 1
+    logger.info(f"Adjusted the timing of {notes_adjusted} notes.")
+    return song
+
+def quantize_notes_to_dynamic_beats(events: list[MusicalEvent], beat_times: np.ndarray) -> list[MusicalEvent]:
+    """
+    Re-calculates note timings based on a dynamic beat grid.
+    Assumes initial event.time is in seconds.
+    """
+    if not beat_times.any():
+        return events # Return original events if no beats were found
+
+    for event in events:
+        note_time_sec = event.time
+        note_duration_sec = event.duration
+
+        # Find the index of the beat that occurs just before or at the note's start time
+        beat_index = np.searchsorted(beat_times, note_time_sec, side='right') - 1
+
+        if beat_index < 0:
+            # Note occurs before the very first detected beat
+            new_time = 0.0
+            new_duration = note_duration_sec / (beat_times[1] - beat_times[0]) # Use first beat's duration as estimate
+        elif beat_index >= len(beat_times) - 1:
+            # Note occurs after the last detected beat
+            new_time = float(beat_index)
+            new_duration = note_duration_sec / (beat_times[-1] - beat_times[-2]) # Use last beat's duration
+        else:
+            # This is the normal case for most notes
+            # Get the timestamps of the surrounding beats
+            start_beat_time = beat_times[beat_index]
+            end_beat_time = beat_times[beat_index + 1]
+            
+            beat_duration_sec = end_beat_time - start_beat_time
+            if beat_duration_sec <= 0: # Avoid division by zero
+                beat_duration_sec = 0.5 # Fallback duration
+
+            # Calculate the note's fractional position within this beat
+            fractional_pos = (note_time_sec - start_beat_time) / beat_duration_sec
+            
+            # The new time is the beat index + its fraction
+            new_time = beat_index + fractional_pos
+            
+            # The new duration is its duration in seconds divided by the beat's duration
+            new_duration = note_duration_sec / beat_duration_sec
+            
+        event.time = new_time
+        event.duration = new_duration
+
+    return events
+
+def dynamic_quantize_song(intermediate_midi_path: str, processed_audio_path: str, args) -> Song:
+    """
+    Loads an intermediate MIDI, detects beats from audio, and returns a requantized Song.
+    """
+    logger.info("--- Performing dynamic beat quantization ---")
+
+    try:
+        import librosa
+    except ImportError:
+        _require_extra('audio', 'dynamic beat quantization', cli=True)
+
+    # 1. Load the PROCESSED audio to get the beat grid
+    y, sr = librosa.load(processed_audio_path, sr=SAMPLE_RATE)
+    
+    # 2. Get the beat timestamps in seconds
+    _, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+    beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+    
+    # 3. Parse the intermediate MIDI file, getting timings in SECONDS
+    temp_converter = MusicConverter()
+    song = temp_converter._parse(intermediate_midi_path, 'mid', args.track, units='seconds')
+
+    # 4. Re-quantize all notes in the song to this dynamic grid
+    for track in song.tracks:
+        track.events = quantize_notes_to_dynamic_beats(track.events, beat_times)
+
+    # 5. Analyze the beat grid to find tempo changes
+    song.tempo_events = analyze_dynamic_tempo(beat_times, song.time_signature)
+    
+    # 6. Set the song's initial tempo to the first detected tempo event or global average
+    if song.tempo_events:
+        song.tempo = song.tempo_events[0].bpm
+    else:
+        from .audio.tempo_detector import librosa_tempo
+        song.tempo = librosa_tempo(y, sr)[0]
+
+    logger.info(f"--- Dynamic quantization complete. Initial tempo set to {song.tempo:.2f} BPM. ---")
+    return song
+
+def tab_options_from(args) -> dict:
+    """The ASCII tab layout options (F08) as keyword arguments for the tab generator."""
+    return {"rhythm": getattr(args, "tab_rhythm", None), "base": getattr(args, "tab_base", None),
+            "odd_bars": getattr(args, "tab_odd_bars", "columns"),
+            "letters": getattr(args, "tab_letters", False),
+            "number_bars": getattr(args, "number_bars", 0)}
+
+
+def transpose_song(song: Song, semitones: int, notes: bool = True) -> None:
+    """Move every note by ``semitones`` (clamped to MIDI's range), and the song's key
+    with them. ``notes=False``: the notes were already moved (a tab slid along its
+    strings), so only the key follows."""
+    if not semitones or not song.tracks:
+        return
+    logger.info(f"--- Transposing all events by {semitones} semitones ---")
+    for track in song.tracks:
+        for event in track.events if notes else ():
+            event.pitch = max(0, min(127, event.pitch + semitones))
+    if song.key is not None and song.key_source == DOUBTED:
+        song.key, song.key_source = None, ""          # a likely default: estimate afresh
+    elif song.key is not None:
+        song.key = song.key.transposed(semitones)
+        song.key_source = f"{song.key_source or FROM_FILE}, transposed"
+
+
+class MusicConverter:
+    def convert(self, song: Song, from_format: str, to_format: str, 
+                command_line: str,
+                nudge: int, 
+                max_line_width: int = 80,
+                transpose: int = 0,
+                no_articulations: bool = False,
+                single_string: Optional[int] = None,
+                mapper_config: Optional[MapperConfig] = None,
+                name_chords: bool = False,
+                chord_tone_threshold: Optional[float] = None,
+                shape_names: bool = False,
+                tab_options: Optional[dict] = None) -> object | str:
+        """
+        Converts a Song object from one format to another.
+        Assumes the Song has already been parsed and filtered.
+        """
+        if from_format == 'mid' and mapper_config and mapper_config.tuning == 'STANDARD' and song.tracks:
+            all_events = [event for track in song.tracks for event in track.events]
+            if all_events:
+                min_pitch = min(event.pitch for event in all_events)
+                if min_pitch == 39: # MIDI pitch for Eb2
+                    logger.info("--- Lowest note detected is Eb2. Automatically switching to E_FLAT tuning. ---")
+                    mapper_config.tuning = 'E_FLAT'
+        
+
+        transpose_song(song, transpose)
+
+        if nudge > 0 and song.tracks:
+            nudge_unit_in_beats = 0.25
+            beat_offset = nudge * nudge_unit_in_beats
+            logger.info(f"--- Nudging all events forward by {beat_offset} beats ---")
+            for track in song.tracks:
+                for event in track.events:
+                    event.time += beat_offset
+
+        output_data = self._generate(song, to_format, command_line=command_line, no_articulations=no_articulations, single_string=single_string, max_line_width=max_line_width, mapper_config=mapper_config,
+                                     name_chords=name_chords, chord_tone_threshold=chord_tone_threshold,
+                                     shape_names=shape_names, tab_options=tab_options)
+
+        return output_data
+
+
+    def _parse(self, data: str, format: str, track_num: Optional[int], staccato: bool = False,  units: str = 'beats', quantization_resolution=0.125, open_string_pitches=None, sustain: str = "legato", capo: Optional[int] = None) -> Song:
+        if format == 'mid':
+            return mid.MidiReader.parse(data, track_number_to_select=track_num)
+        elif format == 'abc':
+            with open(data, 'r') as f:
+                content = f.read()
+            return abc.AbcParser.parse(content)
+        elif format == 'vex':
+            with open(data, 'r') as f:
+                content = f.read()
+            return vex.VextabParser.parse(content)
+        elif format == 'tab':
+            with open(data, 'r') as f:
+                content = f.read()
+            return tab.AsciiTabParser.parse(content, staccato=staccato,
+                                            quantization_resolution=quantization_resolution,
+                                            open_string_pitches=open_string_pitches,
+                                            sustain=sustain, capo=capo)
+        else:
+            raise ValueError(f"Unsupported input format: {format}")
+
+    def _generate(self, song: Song, format: str, command_line: str, no_articulations: bool = False, max_line_width = 80,
+                  single_string: Optional[int] = None, staccato: bool = False, mapper_config: Optional[MapperConfig] = None,
+                  name_chords: bool = False, chord_tone_threshold: Optional[float] = None,
+                  shape_names: bool = False, tab_options: Optional[dict] = None) -> object | str:
+        if format == 'mid':
+            return mid.MidiGenerator.generate(song)
+        elif format == 'abc':
+            return abc.AbcGenerator.generate(song)
+        elif format == 'vex':
+            return vex.VextabGenerator.generate(song, no_articulations=no_articulations, single_string=single_string, mapper_config=mapper_config)
+        elif format == 'tab':
+            return tab.AsciiTabGenerator.generate(song, command_line=command_line, no_articulations=no_articulations, single_string=single_string, max_line_width=max_line_width, mapper_config=mapper_config,
+                                                  name_chords=name_chords, chord_tone_threshold=chord_tone_threshold,
+                                                  shape_names=shape_names, **(tab_options or {}))
+        else:
+            raise ValueError(f"Unsupported output format: {format}")
+
+
+def _your_guitar(args, target_names):
+    """The strung guitar a tuning is shown on, for --show-tuning and the tension
+    warnings: (Instrument, what it's strung for, a note, target pitches high->low).
+
+    The strings are strung for an explicit --tuning; else, when --string-gauges are
+    given, for the tuning shown itself; else for STANDARD (the usual 10-46 guitar,
+    or the 7-string / bass standard when the string count calls for it)."""
+    from .guitar.strings import default_instrument, is_reentrant, parse_gauges
+    n = len(target_names)
+    explicit = getattr(args, "tuning_explicit", False)
+    spec = getattr(args, "string_gauges", None)
+    note = ""
+    if spec and not explicit:
+        base, base_names = None, list(target_names)
+    else:
+        base = (args.tuning or "STANDARD").upper() if explicit else "STANDARD"
+        base_names = list(Tuning[base].value) if base in Tuning.__members__ else None
+        if (base_names is None or len(base_names) != n) and not explicit:
+            base = {6: "STANDARD", 7: "SEVEN_STRING_STANDARD", 4: "BASS_STANDARD"}.get(n)
+            base_names = list(Tuning[base].value) if base else None
+        if base_names is None or len(base_names) != n:
+            note = (f"no {n}-string guitar strung for {args.tuning} to compare against; "
+                    "showing a set designed for this tuning")
+            base, base_names = None, list(target_names)
+    base_pitches = [note_name_to_pitch(x) for x in base_names]
+    gauges = parse_gauges(spec, reentrant=is_reentrant(base_pitches)) if spec else None
+    inst = default_instrument(base or "CUSTOM", list(reversed(base_pitches)),
+                              scale_in=getattr(args, "scale_length", None),
+                              gauges_low_to_high=gauges)
+    target_hl = [note_name_to_pitch(x) for x in reversed(target_names)]
+    return inst, base or ",".join(base_names), note, target_hl
+
+
+def tension_warnings(args, target_names) -> list:
+    """Warnings for strings a tuning would put outside safe tension on your guitar."""
+    from .guitar.strings import retune_report
+    try:
+        inst, strung_for, _, target_hl = _your_guitar(args, target_names)
+    except (ValueError, KeyError):
+        return []
+    _, warnings = retune_report(inst, target_hl)
+    return [f"{w} (on a {inst.describe()} guitar strung for {strung_for})" for w in warnings]
+
+
+def run_show_tuning(args) -> int:
+    """--show-tuning [NAME]: a tuning's notes, and each string's tension on your guitar."""
+    from .arguments import resolve_custom_tuning
+    from .guitar.strings import retune_report
+    if args.show_tuning:
+        shown = args.show_tuning.upper()
+        if shown not in Tuning.__members__:
+            print(f"Error: Tuning '{args.show_tuning}' not found.")
+            print("Use --list-tunings to see all available options.")
+            return 1
+        names = list(Tuning[shown].value)
+    else:
+        custom = resolve_custom_tuning(args)
+        shown = "custom" if custom else (args.tuning or "STANDARD").upper()
+        if not custom and shown not in Tuning.__members__:
+            print(f"Error: '{shown}' has no strings to show.")
+            return 1
+        names = list(custom) if custom else list(Tuning[shown].value)
+    try:
+        inst, strung_for, note, target_hl = _your_guitar(args, names)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return 1
+    print(f"Tuning: {shown}")
+    print(f"Notes:  {' '.join(names)} (low to high)")
+    print(f"Guitar: {inst.describe()}, strung for {strung_for}")
+    if note:
+        print(f"({note})")
+    rows, warnings = retune_report(inst, target_hl)
+    print()
+    print("\n".join(rows))
+    print()
+    if warnings:
+        print(f"{len(warnings)} of {len(names)} strings outside safe tension.")
+    else:
+        print("Every string within safe tension.")
+    return 0
+
+
+def run_solve_tuning(args) -> int:
+    """--solve-tuning: melody -> tuning under which an all-open tab plays it."""
+    from .guitar.tuning_solver import solve_open_string_tuning, format_open_string_tab
+
+    names = [s.strip() for s in args.solve_tuning.split(",") if s.strip()]
+    try:
+        targets = [note_name_to_pitch(n) for n in names]
+    except ValueError as e:
+        logger.error(f"--solve-tuning: bad note name ({e}); use names with octave, e.g. C4,G4.")
+        return 1
+    if not targets:
+        logger.error("--solve-tuning: no target notes given.")
+        return 1
+    try:
+        open_pitches, assignment = solve_open_string_tuning(targets, max_strings=args.max_strings)
+    except ValueError as e:
+        logger.error(f"--solve-tuning: {e}")
+        return 1
+
+    tuning_names = [pitch_to_note_name(p) for p in open_pitches]   # high->low
+    low_to_high = ",".join(reversed(tuning_names))
+    tab = format_open_string_tab(tuning_names, assignment)
+    print(f"Solved tuning (low->high): {low_to_high}")
+    print(f"A {len(open_pitches)}-string guitar tuned thus plays this melody from an "
+          f"all-open-string tab:\n")
+    print(tab)
+    # F04: any string, of any gauge, tuned this high? (Plain steel's breaking pitch
+    # depends only on the scale length, so this holds whatever strings you use.)
+    from .guitar.strings import BREAK_AT, RISKY_AT, plain_stress
+    scale = getattr(args, "scale_length", None) or 25.5
+    risky = []
+    for p in sorted(set(open_pitches), reverse=True):
+        ps = plain_stress(p, scale)
+        if ps >= RISKY_AT:
+            risky.append(f"{pitch_to_note_name(p)} ({100 * ps:.0f}% of breaking strength: "
+                         f"{'past the breaking point' if ps >= BREAK_AT else 'a snap risk'})")
+    if risky:
+        print(f"\nString physics, {scale:g}\" scale: {'; '.join(risky)}. That holds for any "
+              "gauge; a shorter scale (e.g. --scale-length 24.75) lowers it.")
+    print(f"\nHear it:  gtrsnipe --solve-tuning \"{args.solve_tuning}\" --play --audio fluidsynth --soundfont FONT.sf2")
+
+    # Pre-mapped Song (open strings): pitch = the sounding target; string/fret fixed.
+    events = [MusicalEvent(time=i * 0.5, pitch=p, duration=0.5, velocity=100,
+                           string=assignment[i], fret=0)
+              for i, p in enumerate(targets)]
+    song = Song(tracks=[Track(events=events)], tempo=120.0, title="solved")
+    args.tuning_pitches = low_to_high   # so build_mapper_config sets custom_tuning
+    mapper_config = build_mapper_config(args, tuning="CUSTOM", num_strings=len(open_pitches))
+
+    if args.play:
+        from .player.app import run_player_from_args, audio_from_args, _choose_sink
+        try:
+            audio = audio_from_args(args)
+        except (RuntimeError, ValueError) as e:
+            logger.error(str(e))
+            return 1
+        sink = _choose_sink(args)
+        try:
+            run_player_from_args(song, mapper_config, args, mapped=True, sink=sink, audio=audio)
+        except KeyboardInterrupt:
+            sys.stderr.write("\nStopped.\n")
+        finally:
+            audio.close()
+        return 0
+
+    for out in (args.output or []):
+        p = Path(out)
+        if p.suffix.lower() == ".mid":
+            from .formats.mid.generator import MidiGenerator
+            save_midi_file(MidiGenerator.generate(song), str(p))
+        else:
+            save_text_file(tab + "\n", str(p))
+        logger.info(f"Wrote {out}")
+    return 0
+
+
+def _mapper_options_given(parser, args) -> list:
+    """The mapper options set to something other than their default (as --flags)."""
+    import argparse
+    from .arguments import add_mapper_args
+    probe = argparse.ArgumentParser(add_help=False)
+    add_mapper_args(probe)
+    given = []
+    for action in probe._actions:
+        if action.dest in ("quantization_resolution", "dedupe"):     # not fingering choices
+            continue
+        if getattr(args, action.dest, action.default) != action.default:
+            given.append(max(action.option_strings, key=len))
+    return given
+
+
+def _tab_header_names(path: str) -> Optional[list]:
+    """A .tab file's own '// Tuning:' header as note names LOW -> high, or None."""
+    try:
+        with open(path) as f:
+            pitches = tab.AsciiTabParser.header_tuning(f.read())
+    except OSError:
+        return None
+    return [pitch_to_note_name(p) for p in reversed(pitches)] if pitches else None
+
+
+def _load_homograph_song(spec: str, args, anchor_open: list):
+    """A --homograph SONG: a file (.mid[:TRACK]/.abc/.tab/.vex) or an inline
+    melody. Returns (song, title, open pitches a .tab was decoded in | None)."""
+    import re
+    from .guitar.homograph import parse_inline, window
+
+    path, track, span = spec, args.track, None
+    m = re.match(r"^(.+?)(?::(\d+))?(?:@(\d+)-(\d+))?$", spec)
+    if not os.path.exists(spec) and m and os.path.exists(m.group(1)):
+        path = m.group(1)
+        track = int(m.group(2)) if m.group(2) else track
+        span = (int(m.group(3)), int(m.group(4))) if m.group(3) else None
+    tab_open = None
+    if os.path.exists(path):
+        fmt = Path(path).suffix.lower().lstrip('.')
+        if fmt in ('tab', 'txt'):           # classtab.org and most tab sites ship .txt
+            with open(path, errors='replace') as f:
+                content = f.read()
+            # A tab decodes in its own '// Tuning:' header, else the anchor tuning.
+            tab_open = tab.AsciiTabParser.header_tuning(content) or anchor_open
+            song = tab.AsciiTabParser.parse(content, open_string_pitches=tab_open,
+                                            quantization_resolution=args.quantization_resolution)
+        elif fmt in ('mid', 'abc', 'vex'):
+            song = MusicConverter()._parse(path, fmt, track,
+                                           quantization_resolution=args.quantization_resolution)
+        else:
+            raise ValueError(f"{path}: --homograph reads .mid/.abc/.tab/.txt/.vex "
+                             "(transcribe audio to .mid first)")
+        title = Path(path).stem + (f":{track}" if track and fmt == 'mid' else "")
+        if span:
+            song = window(song, *span, resolution=args.quantization_resolution)
+            title += f"@{span[0]}-{span[1]}"
+    else:
+        try:
+            song = parse_inline(spec)
+        except ValueError as e:
+            raise ValueError(f"{spec!r} is neither a file nor an inline melody ({e})")
+        toks = spec.replace(",", " ").split()
+        title = " ".join(toks[:4]) + (" ..." if len(toks) > 4 else "")
+    song = filter_by_velocity(song, args.velocity_cutoff)
+    if not args.no_pre_quantize:
+        song = pre_quantize_song(song, args.quantization_resolution)
+    return song, title, tab_open
+
+
+def run_homograph(args, command_line: str = "") -> int:
+    """--homograph: one tab that plays a different song under each song's tuning."""
+    import shlex
+    from .arguments import resolve_custom_tuning, resolve_named_tuning
+    from .guitar import homograph as hg
+
+    specs = args.homograph
+    if len(specs) < 2:
+        logger.error("--homograph needs at least two songs.")
+        return 1
+    custom = resolve_custom_tuning(args)
+    if custom:
+        tuning, num_strings = "CUSTOM", len(custom)
+    elif args.tuning.upper() == 'PIANO':
+        logger.error("--homograph needs a string instrument (not --tuning PIANO).")
+        return 1
+    else:
+        try:   # the converter's own shortcuts: STANDARD + --num-strings 7/4, --bass
+            tuning, num_strings = resolve_named_tuning(args.tuning, args.num_strings, args.bass)
+        except ValueError as e:
+            logger.error(str(e))
+            return 1
+    if args.capo:
+        logger.warning("--homograph ignores --capo: the shared tab's frets count from the nut.")
+    cfg = build_mapper_config(args, tuning=tuning, num_strings=num_strings)
+    anchor_name = ",".join(custom) if custom else tuning
+
+    def _shift_arg(value, flag):
+        if value in ("auto", "keep"):
+            return value
+        try:
+            return int(value)
+        except ValueError:
+            raise ValueError(f"{flag} takes auto, keep, or an integer")
+
+    try:
+        transpose = _shift_arg(args.homograph_transpose, "--homograph-transpose")
+        transpose_a = _shift_arg(args.homograph_transpose_a, "--homograph-transpose-a")
+        rhythm = args.homograph_rhythm
+        if rhythm not in ("strict", "sequence"):
+            try:
+                rhythm = float(rhythm)
+            except ValueError:
+                rhythm = 0.0
+            if rhythm < 1:
+                raise ValueError("--homograph-rhythm takes strict, sequence, or a ratio >= 1 "
+                                 "(e.g. 1.5)")
+        from .guitar.strings import default_instrument, is_reentrant, parse_gauges
+        anchor_open = open_string_pitches_for(tuning, custom)
+        gauges = (parse_gauges(args.string_gauges, reentrant=is_reentrant(anchor_open[::-1]))
+                  if args.string_gauges else None)
+        instrument = default_instrument(tuning, anchor_open, scale_in=args.scale_length,
+                                        gauges_low_to_high=gauges)
+    except ValueError as e:
+        logger.error(str(e))
+        return 1
+
+    songs, titles, tab_tuning = [], [], None
+    for i, spec in enumerate(specs):
+        try:
+            song, title, tab_open = _load_homograph_song(spec, args, anchor_open)
+        except (ValueError, OSError) as e:
+            logger.error(f"--homograph: {e}")
+            return 1
+        if i == 0:
+            tab_tuning = tab_open
+            if args.transpose:
+                for t in song.tracks:
+                    for e in t.events:
+                        e.pitch += args.transpose
+        songs.append(song)
+        titles.append(title)
+
+    labels = [chr(65 + i) for i in range(len(songs))]
+    report = hg.analyze(songs, labels=labels, titles=titles, anchor=cfg,
+                        anchor_name=anchor_name, mode=args.homograph_mode,
+                        instrument=instrument, max_fret=args.max_fret,
+                        max_strings=args.max_strings, rhythm=rhythm,
+                        subdivide=args.homograph_subdivide, transpose=transpose,
+                        transpose_a=transpose_a, max_retune=args.homograph_max_retune,
+                        octaves=args.homograph_octaves,
+                        resolution=args.quantization_resolution, tab_tuning=tab_tuning,
+                        max_discomfort=args.homograph_max_discomfort)
+    print(hg.format_report(report))
+    sol = report.solution
+    if sol is None:
+        return 1
+
+    text = hg.render_tab(report, sol, neutral=args.homograph_neutral,
+                         max_line_width=max(args.max_line_width, 60),
+                         command_line=command_line, base_config=cfg,
+                         tempo=songs[0].tempo, time_signature=songs[0].time_signature,
+                         tab_options=tab_options_from(args))
+    problems = hg.verify_text(report, sol, text)
+    if problems:          # never hand out a tab whose text doesn't decode to the songs
+        logger.error("internal error (please report): the rendered tab does not decode "
+                     f"to the songs: {problems[0]}")
+        return 1
+    print("\n" + text)
+
+    written = None
+    for out in (args.output or []):
+        p = Path(out)
+        if p.suffix.lower() != '.tab':
+            logger.error(f"--homograph writes the shared tab as .tab (got {out}); "
+                         "decode it per song with -i FILE.tab --tuning-pitches KEY.")
+            return 1
+        if p.exists() and not args.yes:
+            logger.error(f"Output file '{p}' already exists (use -y to overwrite).")
+            return 1
+        save_text_file(text + "\n", str(p))
+        print(f"Wrote {out}")
+        written = out
+    target = written or "SHARED.tab"
+    print("\nSame tab, one tuning per song:")
+    for j, lab in enumerate(labels):
+        print(f"  gtrsnipe -i {shlex.quote(target)} --tuning-pitches "
+              f"{shlex.quote(','.join(sol.tuning_names(j)))} -o {lab.lower()}.mid"
+              f"     # {lab}: {titles[j]}")
+
+    if args.play:
+        letter = (args.homograph_play or "B").upper()
+        if letter not in labels:
+            logger.error(f"--homograph-play {letter}: choose one of {', '.join(labels)}.")
+            return 1
+        j = labels.index(letter)
+        from .player.app import run_player_from_args, audio_from_args, _choose_sink
+        try:
+            audio = audio_from_args(args, songs[j])
+        except (RuntimeError, ValueError) as e:
+            logger.error(str(e))
+            return 1
+        song_j = hg.decoded_song(report.slots, sol, j, title=titles[j],
+                                 tempo=songs[0].tempo, time_signature=songs[0].time_signature)
+        try:
+            run_player_from_args(song_j, hg.config_for_song(sol, j, cfg), args,
+                                 mapped=True, sink=_choose_sink(args), audio=audio)
+        except KeyboardInterrupt:
+            sys.stderr.write("\nStopped.\n")
+        finally:
+            audio.close()
+    return 0
+
+
+def main():
+    command_line = " ".join(sys.argv)
+    parser = setup_parser()
+    args = apply_profiles(parser)
+
+    if args.list_tunings:
+        print("Available Tunings:")
+
+        max_name_len = max(len(t.name) for t in Tuning)
+
+        for tuning in Tuning:
+            notes = ' '.join(tuning.value)
+            print(f"- {tuning.name.ljust(max_name_len)} : {notes}")
+        exit(0)
+
+    if args.show_tuning is not None:
+        exit(run_show_tuning(args))    
+    
+    if args.name_chord:
+        from .chords.shape import run_name_chord
+        exit(run_name_chord(args))
+
+    if args.solve_tuning:
+        setup_logger(logging.DEBUG if args.debug else logging.INFO)
+        exit(run_solve_tuning(args) or 0)
+
+    if args.homograph:
+        # The report IS the output; keep pipeline INFO chatter out of it.
+        setup_logger(logging.DEBUG if args.debug else logging.WARNING)
+        import shlex     # keep inline melodies quoted in the tab's header line
+        exit(run_homograph(args, shlex.join(sys.argv)) or 0)
+
+    if not args.input:
+        parser.error("the following argument is required: -i/--input")
+    if not args.play and not args.output and not args.analyze:
+        parser.error("provide at least one -o/--output (or use --play to visualize)")
+
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    setup_logger(log_level)
+ 
+    SAMPLE_RATE=44100
+
+    tuning_name = None
+
+    try:
+        current_file = args.input
+        original_from_format = Path(args.input).suffix.lower()
+        #output_ext = Path(args.output).suffix.lower()
+        KNOWN_NON_AUDIO_FORMATS = ['.mid', '.abc', '.vex', '.tab']
+        is_audio_input = original_from_format not in KNOWN_NON_AUDIO_FORMATS
+
+        min_freq = None
+        max_freq = None
+ 
+        tuning_name = tuning_name or args.tuning.upper()
+        num_strings = args.num_strings
+
+        # A user-defined tuning (--tuning-pitches / --drop-low-string) bypasses the
+        # named-tuning resolution and validation below.
+        from .arguments import adopt_tab_header, resolve_custom_tuning
+        user_custom = resolve_custom_tuning(args)     # asked for, not adopted from a tab
+        # A .tab input with no tuning (or capo) asked for adopts its own '// Tuning:'
+        # and '// Capo:' lines for the WHOLE run -- decode, range filter, mapping and
+        # any tab output -- as if --tuning-pitches and --capo named them.
+        adopt_tab_header(args, args.input)
+        custom_names = resolve_custom_tuning(args)    # low->high note names, or None
+        is_tab_input = Path(args.input).suffix.lower() == '.tab'
+        if is_tab_input and args.refinger is False and args.single_string is not None:
+            parser.error("--single-string re-fingers the tab, so it can't be combined with --no-refinger.")
+        is_custom = custom_names is not None
+        if is_custom:
+            tuning_name = "CUSTOM"
+            num_strings = len(custom_names)
+        if user_custom:
+            # F04: a tuning you set yourself that would overload (or floppily slacken)
+            # a string of your guitar. A tab's own header tuning is taken as given.
+            for w in tension_warnings(args, list(user_custom)):
+                logger.warning(f"Tension: {w}")
+
+        # PIANO: full-range passthrough to MIDI. No strings, so no range filter, no
+        # mapper, and nothing that needs a fretboard.
+        is_piano_mode = (not is_custom) and tuning_name == 'PIANO'
+        if is_piano_mode and (args.play or args.analyze or not args.output or any(
+                Path(o).suffix.lower() not in ('.mid', '.midi') for o in args.output)):
+            parser.error("--tuning PIANO can only be used with MIDI output (e.g., a .mid file).")
+
+        if not is_custom and not is_piano_mode:
+            # the named tuning with the CLI's shortcuts applied (--bass, --num-strings)
+            from .arguments import resolve_named_tuning
+            try:
+                tuning_name, num_strings = resolve_named_tuning(tuning_name, num_strings, args.bass)
+            except ValueError as e:
+                parser.error(str(e))
+            if args.bass:
+                args.tuning = tuning_name
+
+ 
+        if not args.no_constrain_frequency and not is_piano_mode:
+            logger.info("--- Calculating frequency range based on selected tuning ---")
+            try:
+                tuning_notes = custom_names if is_custom else Tuning[tuning_name].value
+                open_string_pitches = [note_name_to_pitch(n) for n in tuning_notes]
+                
+                min_pitch = min(open_string_pitches)
+                max_pitch = max(open_string_pitches) + args.max_fret
+
+                if not args.no_constrain_frequency and args.min_note_override:
+                    try:
+                        override_pitch = note_name_to_pitch(args.min_note_override)
+                        logger.info(f"Overriding minimum pitch from {pitch_to_note_name(min_pitch)} to {pitch_to_note_name(override_pitch)}.")
+                        min_pitch = override_pitch
+                    except ValueError:
+                        logger.error(f"Invalid note name for --min-note-override: '{args.min_note_override}'")
+
+                if not args.no_constrain_frequency and args.max_note_override:
+                    try:
+                        override_pitch = note_name_to_pitch(args.max_note_override)
+                        logger.info(f"Overriding maximum pitch from {pitch_to_note_name(max_pitch)} to {pitch_to_note_name(override_pitch)}.")
+                        max_pitch = override_pitch
+                    except ValueError:
+                        logger.error(f"Invalid note name for --max-note-override: '{args.max_note_override}'")
+
+                min_freq = midi_to_hz(min_pitch)
+                max_freq = midi_to_hz(max_pitch)
+                
+                logger.info(
+                    f"Constraining frequency to {min_freq:.2f} Hz - {max_freq:.2f} Hz "
+                    f"({pitch_to_note_name(min_pitch)} to {pitch_to_note_name(max_pitch)})"
+                )
+
+            except KeyError:
+                logger.error(f"Tuning '{args.tuning}' not found. Cannot calculate frequency range.")
+                exit(1)
+        
+
+        processed_audio_for_beats = ""
+
+        # --- Audio Pipeline Execution ---
+        if is_audio_input:
+            logger.info("--- Audio input detected. Starting audio-to-MIDI pipeline. ---")
+            try:
+                import librosa
+            except ImportError:
+                _require_extra('audio', 'audio input transcription', cli=True)
+            try:
+                from .audio.pitch_detector_lr import transcribe_to_midi_with_lr
+            except ImportError:
+                _require_extra('audio', 'librosa pYIN pitch detection', cli=True)
+
+            processed_audio_for_beats = current_file
+
+            if args.stem_track:
+                try:
+                    from .audio.separator import separate_instrument
+                except ImportError:
+                    _require_extra('separation', 'stem isolation (demucs)', cli=True)
+                current_file = separate_instrument(current_file,
+                                                   instrument=args.stem_track,
+                                                   model_name=args.demucs_model)
+
+            if args.low_pass_filter and max_freq:
+                from .audio.cleaner import apply_low_pass_filter
+                current_file = apply_low_pass_filter(current_file, cutoff_hz=max_freq, sr=SAMPLE_RATE)
+
+            if args.nr:
+                from .audio.cleaner import cleanup_audio
+                current_file = cleanup_audio(current_file)
+
+            # Determine the correct path for the intermediate MIDI file.
+            intermediate_midi_path = None
+            # Check if any of the requested outputs is a midi file.
+            # (args.output is None when --play is used without -o.)
+            for out_path in (args.output or []):
+                if Path(out_path).suffix.lower() == '.mid':
+                    intermediate_midi_path = out_path
+                    break
+
+            # If no MIDI output was requested, create a temporary path.
+            if intermediate_midi_path is None:
+                intermediate_midi_path = Path(args.input).with_suffix('.mid').name
+
+            # librosa pYIN is the only pitch engine (basic-pitch was removed in v0.3.0).
+            # Note: fmin and fmax could be derived from --constrain-frequency
+            # for a more integrated solution.
+            current_file = transcribe_to_midi_with_lr(
+                current_file,
+                intermediate_midi_path,
+                fmin_hz=min_freq or librosa.note_to_hz('C1'),
+                fmax_hz=max_freq or librosa.note_to_hz('G4')
+            )
+
+
+
+        # --- Final Conversion (The "Last Mile") ---
+        # At this point, current_file is the path to a MIDI file (either original input or from the pipeline)
+
+        converter = MusicConverter()
+        format_to_parse = Path(current_file).suffix.lstrip('.')
+        if args.dynamic_quantize and is_audio_input:
+            # If dynamic quantize is on, we build the Song object here
+            song = dynamic_quantize_song(current_file, processed_audio_for_beats, args)
+        else:
+            # Otherwise, we parse normally
+            logger.info(f"--- Parsing '{current_file}' as a {format_to_parse} file for final conversion ---")
+            read_open = open_string_pitches_for(tuning_name, custom_names)
+            read_capo = args.capo or 0
+            if format_to_parse == 'tab' and args.refinger:
+                # --refinger: the tab is read as it states itself (its own tuning and
+                # capo lines), and --tuning / --capo are what it is re-fingered FOR.
+                with open(current_file) as f:
+                    if tab.AsciiTabParser.header_tuning(f.read()):
+                        read_open = None
+                read_capo = None
+            song = converter._parse(current_file, format_to_parse, args.track, staccato=args.staccato,
+                                    quantization_resolution=args.quantization_resolution,
+                                    open_string_pitches=read_open, sustain=args.sustain, capo=read_capo)
+        
+        apply_key(song, args.key)
+        debug_song_state(song, 5, "After Parsing") 
+        # A tab states its fingering. It is kept as written unless the user asks for it
+        # to be re-fingered, or an option changes the notes or says how to finger them.
+        slid = False
+        if song and format_to_parse == 'tab':
+            if args.refinger:
+                song.refingered = "--refinger"
+            elif args.single_string is not None:
+                song.refingered = "--single-string"
+            elif args.transpose and args.refinger is None:
+                song.refingered = "--transpose changed the notes"
+            elif args.transpose:                      # --no-refinger: along the same strings
+                from .guitar.fingering import slide
+                stuck = slide(song, args.transpose, args.max_fret)
+                if stuck:
+                    logger.error(f"--transpose {args.transpose} with --no-refinger: {len(stuck)} "
+                                 "note(s) can't stay on their string:")
+                    for line in stuck[:10]:
+                        logger.error(f"  {line}")
+                    if len(stuck) > 10:
+                        logger.error(f"  ... and {len(stuck) - 10} more")
+                    logger.error("Drop --no-refinger to let the mapper re-finger the transposed tab.")
+                    exit(1)
+                slid = True
+            song.as_written = not song.refingered
+            if song.refingered:
+                logger.info(f"--- Re-fingering the tab ({song.refingered}) ---")
+            else:
+                logger.info("--- Keeping the tab's own fingering, as written "
+                            "(--refinger lets the mapper choose) ---")
+                if args.refinger is None:
+                    changed = _mapper_options_given(parser, args)
+                    if changed:
+                        logger.info(f"    Mapper options have no effect on it: {', '.join(changed)}")
+
+        # --transpose, once, before anything looks at the notes: the range filter,
+        # --analyze, the player and every output (chord charts included)
+        if song:
+            transpose_song(song, args.transpose, notes=not slid)
+        
+        if not song:
+            logger.error(f"Failed to parse {format_to_parse} file or file is empty.")
+            exit(1)
+
+        if args.first_note_is_downbeat:
+            all_events = [event for track in song.tracks for event in track.events]
+            if all_events:
+                # Find the time of the very first note across all tracks
+                first_note_time = min(event.time for event in all_events)
+                
+                # If there's leading silence, shift the entire song
+                if first_note_time > 0:
+                    logger.info(f"--- First note is downbeat: Shifting timeline by {-first_note_time:.3f} beats ---")
+                    for track in song.tracks:
+                        for event in track.events:
+                            event.time -= first_note_time
+
+        initial_note_count = sum(len(track.events) for track in song.tracks)
+        logger.info(f"Parsed {initial_note_count} initial notes from the input file.")
+
+        song.title = Path(os.path.basename(args.input)).stem
+
+        # NOTE: when --dynamic-quantize is set, dynamic_quantize_song() above has
+        # already built and beat-quantized the song from the processed audio. A
+        # second quantization pass previously lived here and re-quantized the
+        # already-quantized events against a grid recomputed from the raw input
+        # (double-quantization) — removed in v0.3.0.
+
+        mapper_config = None
+
+        if not is_piano_mode:
+            mapper_config = build_mapper_config(
+                args, tuning=tuning_name, num_strings=num_strings)
+        
+        song = filter_by_velocity(song, args.velocity_cutoff)
+        
+        debug_song_state(song, 5, "After Velocity Filter")
+
+        if not args.no_pre_quantize and mapper_config and not song.as_written:
+            logger.info(f"Pre-quantizing before any fretboard mapping.")
+            song = pre_quantize_song(song, args.quantization_resolution)    
+            
+            debug_song_state(song, 5, "After Pre-Quantization")
+        
+        if not is_piano_mode:
+            if args.analyze:
+                logger.info(f"--- Analyzing Processed Song Data ---")
+                all_events = [event for track in song.tracks for event in track.events]
+                if not all_events:
+                    logger.info("No musical events found in the specified pitch range.")
+                    exit(0)
+
+                min_pitch = min(event.pitch for event in all_events)
+                max_pitch = max(event.pitch for event in all_events)
+
+                # F03: finger the song in every tuning whose range fits (with the
+                # user's own mapper settings) and rank them by playability.
+                from .guitar.analyze import format_ranking, rank_tunings
+                pool = [(t.name, t.value) for t in Tuning
+                        if t.name.startswith("BASS_") == bool(args.bass)]
+                custom_pitches = [note_name_to_pitch(n) for n in custom_names] if is_custom else None
+                if is_custom and not any([note_name_to_pitch(n) for n in names] == custom_pitches
+                                         for _, names in pool):
+                    pool.insert(0, ("CUSTOM " + ",".join(custom_names), tuple(custom_names)))
+                candidates = []
+                for name, names in pool:
+                    open_notes = [note_name_to_pitch(n) for n in names]
+                    if min_pitch < min(open_notes) or max_pitch > max(open_notes) + args.max_fret:
+                        continue
+                    cfg = copy.deepcopy(mapper_config)
+                    if not name.startswith("CUSTOM"):
+                        cfg.tuning, cfg.custom_tuning, cfg.num_strings = name, None, len(names)
+                    candidates.append((name, cfg))
+
+                print(f"{song.title}: {len(all_events)} notes, {pitch_to_note_name(min_pitch)} to "
+                      f"{pitch_to_note_name(max_pitch)}; {len(candidates)} of {len(pool)} "
+                      f"{'bass ' if args.bass else ''}tunings fit a {args.max_fret}-fret neck.")
+                if not candidates:
+                    print("No tuning fits this song's pitch range.")
+                else:
+                    logger.info(f"Fingering the song in {len(candidates)} tunings...")
+                    print(format_ranking(rank_tunings(song, candidates)))
+                exit(0)
+
+            initial_note_count = sum(len(track.events) for track in song.tracks)
+        
+            # The RESOLVED tuning (e.g. STANDARD + --num-strings 7 -> SEVEN_STRING_STANDARD),
+            # not the raw --tuning value, or a 7-string's low B notes get dropped.
+            constrain_tuning_notes = custom_names if is_custom else Tuning[tuning_name].value
+            constrain_open_notes = [note_name_to_pitch(n) for n in constrain_tuning_notes]
+            min_range = min(constrain_open_notes)
+            max_range = max(constrain_open_notes) + args.max_fret
+            pitch_shifted = 0
+
+            for track in song.tracks:
+                if args.normalize_pitch:
+                    for event in track.events:
+                        while event.pitch > max_range: 
+                            event.pitch -= 12
+                            pitch_shifted = pitch_shifted + 1
+                        while event.pitch < min_range: 
+                            event.pitch += 12
+                            pitch_shifted = pitch_shifted + 1
+                    logger.info(f"--- Pitch normalization active: All notes constrained to {tuning_name} range ---")
+                else:
+                    logger.info(f"--- Pitch normalization NOT active: Dropping notes outside of {tuning_name} range ---")
+                    track.events = [e for e in track.events if min_range <= e.pitch <= max_range]
+
+            final_note_count = sum(len(track.events) for track in song.tracks)
+            notes_discarded = initial_note_count - final_note_count
+            if notes_discarded > 0:
+                logger.info(f"--- Dropped {notes_discarded} out-of-range notes (Playable range: {pitch_to_note_name(min_range)} - {pitch_to_note_name(max_range)}) ---")
+            elif pitch_shifted > 0:
+                logger.info(f"--- Shifted {pitch_shifted} notes by octaves to fit ---")
+
+        # --- Player mode: visualize instead of writing files (reuses the full
+        # preamble above, so --play inherits audio input, normalize, etc.). ---
+        if args.play:
+            # (PIANO tuning already exits earlier via parser.error, so no guard here.)
+            from .player.app import run_player_from_args, audio_from_args, _choose_sink
+            try:
+                audio = audio_from_args(args, song)
+            except (RuntimeError, ValueError) as e:
+                logger.error(str(e))
+                return
+            sink = _choose_sink(args)
+            try:
+                run_player_from_args(copy.deepcopy(song), mapper_config, args,
+                                     mapped=False, sink=sink, audio=audio)
+            except KeyboardInterrupt:
+                sys.stderr.write("\nStopped.\n")
+            finally:
+                audio.close()   # release the backend even if map/run raised early
+            return
+
+        logger.info("--- Generating output files ---")
+
+        for output_path_str in args.output:
+            output_path = Path(output_path_str)
+            name = output_path.name.lower()
+            if name.endswith(".chords") or name.endswith(".chords.md"):
+                to_format = "chords"
+            else:
+                to_format = output_path.suffix.lstrip('.').lower()
+
+            song_for_conversion = copy.deepcopy(song)
+            config_for_conversion = copy.deepcopy(mapper_config)
+            debug_song_state(song_for_conversion, 5, "Before Final Convert/Map")
+
+            if to_format == "chords":
+                from .chords.chart import build_chord_sheet
+                output_data = build_chord_sheet(
+                    song_for_conversion, config_for_conversion,
+                    measures_per_line=args.measures_per_line,
+                    chord_tone_threshold=args.chord_tone_threshold,
+                    shape_names=getattr(args, "shape_names", False),
+                    prefer_open_chords=getattr(args, "prefer_open_chords", False),
+                    voicing=getattr(args, "chart_voicing", "source"),
+                )
+            else:
+                output_data = converter.convert(
+                    song=song_for_conversion,
+                    command_line=command_line,
+                    from_format=format_to_parse,
+                    to_format=to_format,
+                    nudge=args.nudge,
+                    max_line_width=args.max_line_width,
+                    no_articulations=args.no_articulations,
+                    single_string=args.single_string,
+                    mapper_config=config_for_conversion,
+                    name_chords=args.name_chords,
+                    chord_tone_threshold=getattr(args, "chord_tone_threshold", None),
+                    shape_names=getattr(args, "shape_names", False),
+                    tab_options=tab_options_from(args),
+                )
+
+            if output_path.exists() and not args.yes:
+                logger.error(f"Error: Output file '{output_path}' already exists.")
+                logger.error("Use the -y or --yes flag to allow overwriting.")
+                exit(1)
+
+            logger.info(f"Saving '{args.input}' ({format_to_parse}) to '{output_path_str}' ({to_format})...")
+
+            if to_format == 'mid' and isinstance(output_data, MidiUtilFile):
+                save_midi_file(output_data, str(output_path))
+            elif to_format != 'mid' and isinstance(output_data, str):
+                save_text_file(output_data, str(output_path))
+            else:
+                raise ValueError(f"no {to_format} output was produced for '{output_path_str}'")
+
+    except Exception as e:
+        logger.error(f"An error occurred: {e}", exc_info=args.debug)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

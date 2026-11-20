@@ -1,0 +1,63 @@
+import logging
+from pathlib import Path
+
+from importlib.util import find_spec
+if find_spec("demucs") is None:
+    raise ImportError("The 'demucs' library is required for instrument separation. Try reinstalling gtrsnipe with [all] extras")
+   
+from demucs.separate import main as demucs_run
+
+logger = logging.getLogger(__name__)
+
+def separate_instrument(audio_file: str, instrument: str = "guitar", model_name: str = "htdemucs") -> str:
+    """
+    Separates a specific instrument stem from an audio file using Demucs.
+
+    Args:
+        audio_file: Path to the input audio file.
+        instrument: The instrument to isolate. For Demucs's default model,
+                    'guitar' is in the 'other' stem.
+
+    Returns:
+        The file path to the generated instrument stem.
+    """
+    # The default 4-stem model in Demucs is 'htdemucs', which separates
+    # audio into 'bass', 'drums', 'vocals', and 'other'. Guitars, pianos,
+    # and other melodic instruments are typically in the 'other' stem.
+    # We map our "guitar" input to "other" for demucs. Only the 6-stem model has a
+    # guitar stem. (This was a substring test, `model_name not in 'htdemucs_6s'`,
+    # which is False for 'htdemucs' itself, so guitar was never mapped.)
+    target_stem = "other" if instrument == "guitar" and model_name != "htdemucs_6s" else instrument
+    
+    logger.info(f"--- Isolating '{target_stem}' stem with Demucs... ---")
+    logger.info("This may take a moment depending on the file size and your hardware...")
+
+    # Define the output directory for separated files
+    output_dir = Path("./separated")
+    
+    # Demucs's main function can be called like a command-line script.
+    # We build the list of arguments programmatically.
+    # '-n htdemucs' specifies the default model.
+    # '--two-stems' tells it to save only the target stem and its inverse.
+    # '-o' specifies the output directory.
+    demucs_args = [
+        "--two-stems", target_stem,
+        "-n", model_name,
+        "-o", str(output_dir),
+        audio_file,
+    ]
+
+    # Run the separation process
+    demucs_run(demucs_args)
+
+    # Determine the output file path based on Demucs's naming convention
+    input_path = Path(audio_file)
+    # e.g., separated/htdemucs/song_name/other.wav
+    expected_output = output_dir / model_name / input_path.stem / f"{target_stem}.wav"
+
+    if not expected_output.exists():
+        raise FileNotFoundError(f"Demucs did not produce the expected output file: {expected_output}")
+
+    logger.info(f"Demucs stem successfully generated: {expected_output}")
+    
+    return str(expected_output)

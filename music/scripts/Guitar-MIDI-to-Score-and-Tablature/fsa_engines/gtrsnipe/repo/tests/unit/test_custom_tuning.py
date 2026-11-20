@@ -1,0 +1,256 @@
+"""Tests for custom tunings (--tuning-pitches / --drop-low-string), the tab
+parser honoring a tuning, and the inverse tuning solver."""
+import argparse
+
+import pytest
+
+from gtrsnipe.arguments import (
+    add_mapper_args,
+    add_tuning_args,
+    build_mapper_config,
+    open_string_pitches_for,
+    parse_tuning_pitches,
+    resolve_custom_tuning,
+    resolve_num_strings,
+)
+from gtrsnipe.core.theory import note_name_to_pitch
+from gtrsnipe.guitar.mapper import GuitarMapper
+from gtrsnipe.guitar.tuning_solver import (
+    format_open_string_tab,
+    solve_open_string_tuning,
+)
+
+
+def _parser():
+    p = argparse.ArgumentParser()
+    add_tuning_args(p)
+    add_mapper_args(p)
+    return p
+
+
+# -- parse_tuning_pitches ---------------------------------------------------
+
+def test_parse_tuning_pitches_stored_low_to_high():
+    assert parse_tuning_pitches("A1,E2,A2,D3,F#3,B3") == ("A1", "E2", "A2", "D3", "F#3", "B3")
+
+
+def test_parse_tuning_pitches_validates():
+    with pytest.raises(ValueError):
+        parse_tuning_pitches("A1")           # too few
+    with pytest.raises(ValueError):
+        parse_tuning_pitches("A1,H9")        # bad note name
+
+
+# -- custom tuning through the config ---------------------------------------
+
+def test_build_mapper_config_custom_tuning():
+    a = _parser().parse_args(["--tuning-pitches", "A1,E2,A2,D3,F#3,B3"])
+    cfg = build_mapper_config(a, tuning=a.tuning,
+                              num_strings=resolve_num_strings(a.tuning, a.num_strings))
+    assert cfg.tuning == "CUSTOM"
+    assert cfg.num_strings == 6
+    assert cfg.custom_tuning == ("A1", "E2", "A2", "D3", "F#3", "B3")  # low->high
+    # open pitches are string index 0 = highest (high->low), unchanged by the flip
+    assert GuitarMapper(cfg).open_string_pitches == [59, 54, 50, 45, 40, 33]
+
+
+def test_drop_low_string_on_named_tuning():
+    # BARITONE_B with its low B dropped 2 semitones == the A1 baritone.
+    a = _parser().parse_args(["--tuning", "BARITONE_B", "--drop-low-string", "2"])
+    custom = resolve_custom_tuning(a)
+    assert custom[0] == "A1"   # lowest string (index 0, low->high) dropped B1 -> A1
+
+
+def test_no_custom_tuning_when_plain():
+    a = _parser().parse_args(["--tuning", "DROP_D"])
+    assert resolve_custom_tuning(a) is None
+
+
+def test_renderer_labels_from_custom_tuning():
+    from gtrsnipe.player.render.ascii import AsciiFretboardRenderer
+    a = _parser().parse_args(["--tuning-pitches", "A1,E2,A2,D3,F#3,B3"])
+    cfg = build_mapper_config(a, tuning=a.tuning,
+                              num_strings=resolve_num_strings(a.tuning, a.num_strings))
+    assert AsciiFretboardRenderer(cfg)._string_labels() == ["B", "F#", "D", "A", "E", "A"]
+
+
+# -- tab parser honors the tuning -------------------------------------------
+
+def test_tab_parser_uses_supplied_tuning():
+    from gtrsnipe.formats.tab.parser import AsciiTabParser
+    tab = "e|--0--|\nB|-----|\nG|-----|\nD|-----|\nA|-----|\nE|-----|\n"
+    std = AsciiTabParser.parse(tab)
+    assert [e.pitch for e in std.tracks[0].events] == [64]           # standard high e
+    retuned = AsciiTabParser.parse(tab, open_string_pitches=[62, 59, 55, 50, 45, 40])
+    assert [e.pitch for e in retuned.tracks[0].events] == [62]        # high string -> D4
+
+
+def test_tab_roundtrips_custom_tuning_via_header():
+    # Generate a custom-tuned tab, then re-parse it with NO tuning passed: it must
+    # read the embedded '// Tuning:' header and recover the exact pitches.
+    from gtrsnipe.core.config import MapperConfig
+    from gtrsnipe.core.types import MusicalEvent, Song, Track
+    from gtrsnipe.formats.tab.generator.ascii import AsciiTabGenerator
+    from gtrsnipe.formats.tab.parser import AsciiTabParser
+    cfg = MapperConfig(tuning="CUSTOM", num_strings=6,
+                       custom_tuning=("D2", "A2", "D3", "G3", "A3", "D4"))  # DADGAD
+    pitches = [62, 64, 66, 67, 69]
+    song = Song(tracks=[Track(events=[MusicalEvent(i * 0.5, p, 0.5, 100)
+                                      for i, p in enumerate(pitches)])], tempo=120)
+    tab = AsciiTabGenerator.generate(song, command_line="", mapper_config=cfg)
+    assert "// Tuning: D2,A2,D3,G3,A3,D4" in tab            # low->high header
+    got = sorted(e.pitch for t in AsciiTabParser.parse(tab).tracks for e in t.events)
+    assert got == sorted(pitches)
+
+
+def test_tab_parser_reads_legacy_high_to_low_header():
+    from gtrsnipe.formats.tab.parser import AsciiTabParser
+    tab = ("// Tuning (High to Low): E4 B3 G3 D3 A2 E2\n"
+           "e|--0--|\nB|-----|\nG|-----|\nD|-----|\nA|-----|\nE|-----|\n")
+    assert [e.pitch for e in AsciiTabParser.parse(tab).tracks[0].events] == [64]
+
+
+def test_tab_six_strings_low_e_not_dropped():
+    # Regression: start-char scan uppercased e/E to the same key -> 5 strings, so
+    # low-E notes were silently dropped. Now the low E (index 5) is parsed.
+    from gtrsnipe.formats.tab.parser import AsciiTabParser
+    tab = "e|-----|\nB|-----|\nG|-----|\nD|-----|\nA|-----|\nE|--3--|\n"
+    got = [e.pitch for t in AsciiTabParser.parse(tab).tracks for e in t.events]
+    assert got == [43]   # low E, fret 3 = G2
+
+
+def test_caller_tuning_overrides_header():
+    from gtrsnipe.formats.tab.parser import AsciiTabParser
+    tab = "// Tuning: E2,A2,D3,G3,B3,E4\ne|--0--|\nB|-|\nG|-|\nD|-|\nA|-|\nE|-|\n"
+    # explicit tuning wins over the embedded header (enables tuning-swap re-reads)
+    got = AsciiTabParser.parse(tab, open_string_pitches=[62, 59, 55, 50, 45, 40])
+    assert [e.pitch for e in got.tracks[0].events] == [62]
+
+
+def test_open_string_pitches_for():
+    # Returns string index 0 = highest (high->low); names are low->high so reversed.
+    assert open_string_pitches_for("STANDARD") == [64, 59, 55, 50, 45, 40]
+    assert open_string_pitches_for("CUSTOM", ("E2", "A2")) == [45, 40]  # low->high -> [A2, E2]
+
+
+# -- tuning solver ----------------------------------------------------------
+
+def test_solver_assigns_distinct_pitches_to_open_strings():
+    # Twinkle head: C C G G A A G
+    tgt = [note_name_to_pitch(n) for n in ["C4", "C4", "G4", "G4", "A4", "A4", "G4"]]
+    open_pitches, assignment = solve_open_string_tuning(tgt)
+    assert open_pitches == sorted(set(tgt), reverse=True)   # high -> low, distinct
+    # every note is playable open on its assigned string == the target pitch
+    for note, s in zip(tgt, assignment):
+        assert open_pitches[s] == note
+
+
+def test_solver_rejects_too_many_distinct():
+    tgt = list(range(60, 68))  # 8 distinct pitches
+    with pytest.raises(ValueError):
+        solve_open_string_tuning(tgt, max_strings=6)
+
+
+def test_format_open_string_tab_shows_only_open_strings():
+    tgt = [note_name_to_pitch(n) for n in ["C4", "C4", "G4"]]
+    open_pitches, assignment = solve_open_string_tuning(tgt)
+    from gtrsnipe.core.theory import pitch_to_note_name
+    names = [pitch_to_note_name(p) for p in open_pitches]
+    tab = format_open_string_tab(names, assignment)
+    assert "0" in tab           # frets are all 0 (open)
+    assert all(c in "0-|GACDEFB#\n " or c.isalpha() for c in tab)  # no fret >0 digits
+    assert "1" not in tab and "2" not in tab
+
+
+def _cli_decode(tab_text, tmp_path, *extra, out_name="out.abc"):
+    """Run the real CLI on a .tab; return (sorted pitches of the .abc output, out path)."""
+    import os
+    import subprocess
+    import sys
+    from gtrsnipe.formats.abc.parser import AbcParser
+    tab = tmp_path / "in.tab"
+    tab.write_text(tab_text)
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    env = dict(os.environ, PYTHONPATH=root + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    out = tmp_path / out_name
+    subprocess.run([sys.executable, "-m", "gtrsnipe.converter", "-i", str(tab),
+                    "-o", str(out), "-y", *extra], cwd=root, env=env, check=True,
+                   capture_output=True)
+    if out.suffix == ".abc":
+        return sorted(e.pitch for e in AbcParser.parse(out.read_text()).tracks[0].events), out
+    return None, out
+
+
+def test_cli_decodes_a_tab_in_its_own_header_tuning(tmp_path):
+    # Regression: the CLI always passed STANDARD pitches to the parser, so a
+    # custom-tuned tab's '// Tuning:' header was ignored unless --tuning-pitches
+    # was given. With no tuning asked for, the header now decides.
+    tab = ("// Tuning: D2,A2,D3,G3,A3,D4\n"
+           "e|--0--|\nB|-----|\nG|-----|\nD|-----|\nA|-----|\nE|--2--|\n")
+    assert _cli_decode(tab, tmp_path)[0] == [40, 62]                  # D2+2, D4 (header)
+    assert _cli_decode(tab, tmp_path, "--tuning-pitches", "E2,A2,D3,G3,B3,E4")[0] == [42, 64]
+
+
+def test_cli_header_tuning_governs_the_whole_run(tmp_path):
+    # Regression (review): the header decoded the pitches, but the range filter and
+    # mapping still assumed STANDARD, silently dropping a drop-D tab's low D2s.
+    tab = ("// Tuning: D2,A2,D3,G3,B3,E4\n"
+           "e|-------|\nB|-------|\nG|-------|\nD|-------|\nA|---0---|\nD|-0---0-|\n")
+    assert _cli_decode(tab, tmp_path)[0] == [38, 38, 45]              # D2 D2 A2 all kept
+    _, out = _cli_decode(tab, tmp_path, out_name="out.tab")          # tab -> tab round trip
+    text = out.read_text()
+    assert "// Tuning: D2,A2,D3,G3,B3,E4" in text
+    from gtrsnipe.formats.tab.parser import AsciiTabParser
+    assert sorted(e.pitch for e in AsciiTabParser.parse(text).tracks[0].events) == [38, 38, 45]
+
+
+def test_cli_headerless_tab_still_reads_as_six_string_standard(tmp_path):
+    # Regression (review): two systems back to back with no blank line and no
+    # header must still be read in 6-line blocks (main's behavior), not as 12 strings.
+    sys1 = ["e|-----0-----|", "B|---1---1---|", "G|-2-------2-|",
+            "D|-----------|", "A|-----------|", "E|-----------|"]
+    sys2 = ["e|-----------|", "B|-----------|", "G|-----------|",
+            "D|-2---2---2-|", "A|---3---3---|", "E|-----------|"]
+    got, _ = _cli_decode("\n".join(sys1 + sys2) + "\n", tmp_path)
+    assert got == sorted([57, 60, 64, 60, 57, 52, 48, 52, 48, 52])
+
+
+def test_cli_explicit_tuning_overrides_a_tab_header(tmp_path):
+    # Backlog B04: an EXPLICIT --tuning STANDARD must win over the tab's header;
+    # only the STANDARD *default* defers to it.
+    tab = ("// Tuning: D2,A2,D3,G3,A3,D4\n"
+           "e|--0--|\nB|-----|\nG|-----|\nD|-----|\nA|-----|\nE|--2--|\n")
+    assert _cli_decode(tab, tmp_path)[0] == [40, 62]                        # header
+    assert _cli_decode(tab, tmp_path, "--tuning", "STANDARD")[0] == [42, 64]  # explicit
+
+
+def test_cli_num_strings_7_keeps_the_low_b_string(tmp_path):
+    # Backlog B06: the range filter used the raw --tuning (STANDARD) instead of the
+    # resolved SEVEN_STRING_STANDARD, silently dropping notes below E2.
+    import os
+    import subprocess
+    import sys
+    from midiutil import MIDIFile
+    from gtrsnipe.formats.abc.parser import AbcParser
+    mid = tmp_path / "low.mid"
+    m = MIDIFile(1)
+    m.addTempo(0, 0, 120)
+    for i, p in enumerate([35, 38, 40, 45]):          # B1 D2 E2 A2
+        m.addNote(0, 0, p, i, 1, 100)
+    with open(mid, "wb") as fh:
+        m.writeFile(fh)
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    env = dict(os.environ, PYTHONPATH=root + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    out = tmp_path / "out.abc"
+    subprocess.run([sys.executable, "-m", "gtrsnipe.converter", "-i", str(mid), "-o", str(out),
+                    "-y", "--num-strings", "7"], cwd=root, env=env, check=True, capture_output=True)
+    assert sorted(e.pitch for e in AbcParser.parse(out.read_text()).tracks[0].events) == [35, 38, 40, 45]
+
+
+def test_tuning_explicit_flag_and_profiles(tmp_path):
+    from gtrsnipe.arguments import apply_profiles, setup_parser
+    assert not getattr(setup_parser().parse_args([]), "tuning_explicit", False)
+    assert setup_parser().parse_args(["--tuning", "STANDARD"]).tuning_explicit
+    (tmp_path / "std").write_text("tuning STANDARD\n")
+    args = apply_profiles(setup_parser(), ["--profile", "std", "--config-dir", str(tmp_path)])
+    assert args.tuning == "STANDARD" and args.tuning_explicit      # a profile counts too

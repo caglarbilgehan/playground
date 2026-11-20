@@ -1,0 +1,94 @@
+# Tab homographs: the research
+
+gtrsnipe's `--homograph` finds one ordinary, fingerable tab that plays one song in one tuning
+and a different song in another. (Fingerable, not necessarily comfortable: see R04,
+"Playability".) It began as the executable form of an argument about
+copyright: a tab records *where to put your fingers*, not *what music sounds*, and the tuning
+decides the rest. This folder holds the mathematics, the literature, and the experiments that
+tested how far that argument goes. How the feature itself works is in
+[`../app/DESIGN-homograph.md`](../app/DESIGN-homograph.md).
+
+## Reading order
+
+1. **The one fact everything rests on:** [`../app/DESIGN-homograph.md`](../app/DESIGN-homograph.md)
+   §1. On a single string, fret f sounds `open + f`. So two aligned songs share a tab exactly
+   when their note-for-note intervals split into at most N constant classes, one per string,
+   with no two simultaneous notes in a class and each class within the fret range.
+2. **The structure of those intervals:**
+   [`theory/coupled_transposition_structure.md`](theory/coupled_transposition_structure.md).
+   It covers the offset sequence δ = B − A, *richness* (its number of distinct values), and
+   which statistics of δ are distances.
+3. **What was already known:** [`literature/LITERATURE-offsets.md`](literature/LITERATURE-offsets.md).
+4. **Distances when the alignment is optimized:** [`theory/PROOF-alignment.md`](theory/PROOF-alignment.md),
+   the stutter-invariance principle.
+5. **The experiments** in [`results/`](results/):
+   - [R03](results/RESULTS-R03-families.md): does richness find tune families? *No.*
+   - [R03b](results/RESULTS-R03b-segments.md): phrases and motifs, alignment baselines, and the
+     offset measures under optimal warping: *a small gain at the phrase level.*
+   - [R04](results/RESULTS-R04-scan.md): how often do real songs share a tab?
+   - [R05](results/RESULTS-R05-aswritten.md): what about a real fingering, as written? (gtrsnipe's
+     own wiki tabs of two pieces)
+6. **How it happened:** [`story/`](story/README.md).
+
+## The mapper itself (M01–M03, since 2026-11-04)
+
+The fretboard mapper turned into a second research topic once we measured it. "The fretboard
+problem" (choosing a fingering for a score) has a literature of its own (Sayegh 1989, Radicioni,
+Hori & Sagayama 2016), and estimating how hard a tab is to play has a smaller, newer one
+(2012 to 2025, mostly piano; three guitar papers). What we have so far:
+
+- the weights audit and knob sweep (M01) and Viterbi against greedy across five corpora (M02),
+  in [`../dev/NOTES-playability.md`](../dev/NOTES-playability.md), with the design questions
+  answered there, including hand position as the index finger (2026-11-07);
+- the difficulty literature, [`literature/LITERATURE-difficulty.md`](literature/LITERATURE-difficulty.md),
+  and the first cut of a tab difficulty measure (M03), `gtrsnipe-research difficulty`;
+- the commands: `gtrsnipe-research sweep`, `optimizers`, `difficulty`, and `score` (a tab's
+  fingering scored bar by bar with the mapper's own features x weights, beside the mapper's
+  fingering of the same notes, with the single-knob change that would make a bar tie).
+
+## Where the claims stand (2026-09-30)
+
+| claim | status | evidence |
+|---|---|---|
+| Two aligned melodies share a tab iff their note-for-note intervals split into ≤ N classes of constant interval (with no two simultaneous notes in a class, and each class within the fret range). | **Holds.** A theorem; the solver checks every solution by decoding it. | DESIGN-homograph §1 |
+| Short passages of unrelated songs often share a tab. | **Holds.** Folk: about a third of same-rhythm 8-note phrase pairs from different tunes fit six strings and sound unrelated; 8% at 12 notes, 3% at 16. | R04 |
+| String tension rarely rules a shared tab out. | **Holds.** Folk, 7–20 notes: 93–100% of sampled pairs place on a real guitar with A in standard tuning (23–60% with no gauge change). Pop: 23–90% anchored, 93–97% when both songs retune one guitar. | R04 |
+| Shared tabs are comfortable to play. | **Mostly false.** 49 of 50 sampled pairs have a tab; 19 within 50 mapper points per note of A's own tab, 4 within 20, none within 5. (These counts are lower bounds.) | R04 "Playability"; F06 |
+| A real tab's fingering, as written, is ambiguous. | **Tempered.** Yes for short passages: hundreds of 8-note partners. At 24 and 32 notes, nothing unrelated-sounding fits. The fingering, not the melody alone, decides the partners. (Tested on gtrsnipe's own wiki tabs of two pieces; third-party tabs are next.) | R05 |
+| "Any tab could be any song." | **Only** for short passages, or for a tab stripped of its tuning. | R04 + R05 |
+| Log-richness and offset entropy are pseudometrics modulo transposition (fixed alignment). | **Holds, but elementary.** Present them as applications of known bounds. | theory note §3–4; literature |
+| Other Rényi/Hill orders are not. | **Holds.** Explicit counterexamples; Aczél–Forte–Ng (1974). | `theory/triangle_check.py`; literature §5 |
+| Richness is a useful melodic similarity. | **Not supported for whole melodies.** On tune-family retrieval, transposition-invariant Hamming wins; adding richness, entropy and reuse gains ≤ 0.006 MAP (one grid alignment). **At the phrase level, a small gain:** the offset measures under optimal warping add +0.009 to +0.010 MAP to strong baselines, for all three annotators; none for motifs or within songs. | R03, R03b |
+| Low richness with high reuse marks related passages (§6). | **Not supported in the tests run.** Low richness marks related phrases and motifs with or without reuse, and reuse adds nothing to the baselines. The direct test (sequences, echoes) needs annotations of those. | R03b |
+| With warping-path alignment, stutter-invariant subadditive statistics of δ stay pseudometrics; entropy and 1 − C₁ don't. | **Holds** (proof and numeric check). The proof uses the same coupling-composition mechanism as the Fréchet distance's. We did not find the general condition stated elsewhere; no priority is claimed. | PROOF-alignment; theory note §7 |
+| Counting distinct offsets is unused as a *music* measure. | **Holds as far as searched, in music retrieval.** Mäkinen–Navarro–Ukkonen (2005) define the set but use only its mode; R03 suggests why (as a similarity it's weak). In computer vision the same count is the standard *label cost*. | literature §1, §6; R03 |
+| "Vocabulary vs. switches" is a new distinction. | **No, as a distinction:** computer vision separates label costs from Potts smoothness terms. The guitar version (labels are strings, several may realize one offset, a hard budget) is a constrained analogue of multi-model fitting; we did not find that combination documented. (Citations from memory; to verify.) | theory note §6, §10 |
+| The tab homograph (one tab, two given unrelated melodies, and a solver) is new in the scholarship. | **Holds as far as searched.** Its ingredients are old (scordatura, Allen & Goudeseune 2011). StegTab (2012) is a letter cipher: not prior art for melodic homographs, though it shares the re-keying structure. Its later academic variants are unchecked. | literature §4 |
+
+## Reproducing
+
+- **Code:** [`gtrsnipe/guitar/homograph.py`](../../gtrsnipe/guitar/homograph.py) and
+  [`strings.py`](../../gtrsnipe/guitar/strings.py) (the solver and the string physics), and
+  [`gtrsnipe/research/`](../../gtrsnipe/research/) (the `gtrsnipe-research` CLI: `corpus`,
+  `profile`, `families`, `scan`, `aswritten`). The results docs give their commands.
+- **Scripts:** [`theory/triangle_check.py`](theory/triangle_check.py),
+  [`theory/alignment_check.py`](theory/alignment_check.py), and
+  [`results/r04_plot.py`](results/r04_plot.py).
+- **Data:** the corpora (Essen, the Meertens Tune Collections, Nottingham, POP909, Lakh) are
+  not in the repo, because of their licences. The results docs name the corpora they used.
+
+## Open questions
+
+- [ ] **R13:** the citation pass for the stutter-invariance principle and the Fréchet
+  connection (scottvr, in progress). See PROOF-alignment, "Citations to verify", and the
+  sub-items under R13 in [`../dev/BACKLOG.md`](../dev/BACKLOG.md).
+- [ ] The complexity of the fewest-distinct-offsets warping path (d_richness) on the alignment
+  grid. (R03b computes it exactly up to 6 offsets, the guitar range.)
+- [ ] **R10–R11:** re-rhythm in the scan, and the full Lakh corpus. See
+  [`../dev/BACKLOG.md`](../dev/BACKLOG.md).
+- [ ] **R14, third-party tabs as written** (R05's natural next input), kept local for copyright
+  reasons.
+- [ ] **The structure note's §6 hypothesis, tested directly:** that low richness with high reuse
+  marks sequences, echoes or call-and-response at a fixed interval. R03b's indirect test
+  (phrase and motif identity) didn't support it; a direct test needs annotations of sequences.
+- [ ] **StegTab's later academic variants**, not yet examined.

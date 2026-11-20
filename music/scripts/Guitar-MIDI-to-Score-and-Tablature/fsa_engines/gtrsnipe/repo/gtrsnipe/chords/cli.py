@@ -1,0 +1,91 @@
+"""CLI for the chord-chart output (`gtrsnipe-chords`).
+
+Parses an input file, breaks it into per-measure chords, and writes a Markdown
+chord sheet to stdout (or a file with ``-o``). Shares the full tuning + mapper
+option surface with the main tool via :mod:`gtrsnipe.arguments`.
+"""
+import argparse
+import sys
+from pathlib import Path
+from typing import Optional, Sequence
+
+from ..arguments import (
+    add_chart_args,
+    add_key_arg,
+    add_refinger_arg,
+    adopt_tab_header,
+    apply_key,
+    add_mapper_args,
+    add_profile_args,
+    add_tuning_args,
+    apply_profiles,
+    build_mapper_config,
+    open_string_pitches_for,
+    resolve_num_strings,
+)
+from .chart import build_chord_sheet
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="gtrsnipe-chords",
+        description="Break a song into per-measure chords and print a chord sheet.",
+    )
+    p.add_argument("input", help="Input file (.mid/.abc/.vex/.tab).")
+    p.add_argument("-o", "--output", default=None,
+                   help="Write the sheet to a file (default: stdout).")
+    p.add_argument("--track", type=int, default=None,
+                   help="For MIDI input: 1-indexed track to analyze (default: all).")
+    add_tuning_args(p.add_argument_group("Instrument"))
+    add_mapper_args(p.add_argument_group("Mapper (advanced)"))
+    chart = p.add_argument_group("Chord chart")
+    add_chart_args(chart)
+    add_key_arg(chart)
+    add_refinger_arg(chart)
+    add_profile_args(p)
+    return p
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = apply_profiles(_build_arg_parser(), argv)
+
+    # Imported here to avoid a converter<->chords import cycle at package load.
+    from ..converter import MusicConverter
+
+    adopt_tab_header(args, args.input)          # a tab's own tuning and capo, unless you set them
+    cfg = build_mapper_config(
+        args, tuning=args.tuning,
+        num_strings=resolve_num_strings(args.tuning, args.num_strings),
+    )
+    fmt = Path(args.input).suffix.lstrip(".").lower()
+    try:
+        song = MusicConverter()._parse(
+            args.input, fmt, args.track,
+            open_string_pitches=open_string_pitches_for(cfg.tuning, cfg.custom_tuning),
+            capo=cfg.capo or 0)
+    except (OSError, ValueError) as e:
+        sys.stderr.write(f"gtrsnipe-chords: can't read {args.input}: {getattr(e, 'strerror', None) or e}\n")
+        return 1
+    song.title = song.title if song.title and song.title != "Untitled" else Path(args.input).stem
+    apply_key(song, args.key)
+    song.as_written = fmt == "tab" and not args.refinger     # a tab's own shapes in the diagrams
+
+    sheet = build_chord_sheet(
+        song, cfg,
+        measures_per_line=args.measures_per_line,
+        chord_tone_threshold=args.chord_tone_threshold,
+        shape_names=args.shape_names,
+        prefer_open_chords=args.prefer_open_chords,
+        voicing=args.chart_voicing,
+    )
+
+    if args.output:
+        Path(args.output).write_text(sheet)
+        sys.stderr.write(f"Wrote {args.output}\n")
+    else:
+        sys.stdout.write(sheet)
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

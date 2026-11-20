@@ -1,0 +1,938 @@
+# Playability: design notes
+
+Notes carried over from the parking lot at the 2026-10-05 triage, for the backlog's
+playability items (M01–M07 in [`BACKLOG.md`](BACKLOG.md)). They are the thinking so far,
+as written when each idea was parked, not a plan: each item gets its plan when it starts.
+
+## M01–M03: the scoring weights (audit, Viterbi vs greedy, difficulty), and the parked learning ideas
+
+- **Scoring weights: a whole-tab difficulty score, learned weights and style profiles**
+  (scottvr, 2026-09-27).
+  - Today's weights were hand-balanced one new option at a time. The Asturias wiki page needs
+    a long command line to get a playable tab, while Mr Crowley works with defaults.
+  - Ideas:
+    1. a whole-tab difficulty "meta-score" (fretted notes, total fret travel, position
+       shifts, stretches, …);
+    2. a difficulty estimate for a song *before* transcription, from the MIDI/ABC alone;
+    3. style profiles (flamenco ≈ the Asturias options, rockabilly ≈ barre-friendly) as
+       named option bundles;
+    4. learning the weights rather than hand-tuning them.
+  - Note (Claude): the mapper's score is mostly weight × feature, summed along a Viterbi
+    path, which is textbook structured prediction. A *structured perceptron* can learn the
+    weights from human-fingered tabs: decode, compare with the human fingering, move the
+    weights by the feature difference. That's one Viterbi pass per tab per epoch, and the
+    knobs keep their names. Per-style training data gives style profiles.
+  - Needs human fingerings. Candidates: GuitarSet (hexaphonic recordings, string-level
+    annotations; verify), DadaGP (GuitarPro tabs, gated), scottvr's own tabs.
+  - The hard thresholds (the −1000 unplayable span, the sweet-spot window) stay constraints
+    rather than learned weights.
+  - **First steps, useful even without an optimizer** (discussed 2026-09-27):
+    1. **Audit** each score term: its feature, its unit, what it trades against.
+    2. **Express the defaults as exchange rates**, with `movement_penalty` = 1 "fret of hand
+       travel". The Viterbi fingering depends only on weight *ratios*. Today a string switch
+       = 1.7 frets of travel, a fret above the sweet spot = 1.7 (17 on the low strings), a
+       fretted-open note = 6.7, chord span = 33 per fret.
+    3. **Which weights are structural?** (scottvr, 2026-09-28) Some weights may matter to the
+       scorer's basic behavior whatever the player's taste or the genre; others are
+       preferences. Find out which, from the code. **Also quantify whether the Viterbi mapper's
+       improvement over the old greedy one generalizes.** The docs audit found that under
+       Viterbi, the wiki's Asturias steps 2–5 no longer show the problems that the long
+       command line was built to fix, and the step-5 flags already give nearly the final tab.
+       Measure it across many songs (e.g. the mapper's score per note and hand travel, greedy vs
+       Viterbi, on a corpus sample), not on one piece.
+    4. **Separate the kinds of knob.** Trade-offs (search log-ratios) are different from
+       priorities disguised as big numbers: e.g. `--let-ring-bonus 210` = 70 frets of travel,
+       i.e. "ringing always wins". Priorities are a lexicographic ordering, better expressed
+       as one. Structural settings (sweet-spot bounds, unplayable span, flags) are discrete.
+       `barre_bonus`/`barre_penalty` multiply the same count, so only their difference
+       matters: one knob, not two.
+    5. **Sensitivity sweep**: vary one knob at a time on a few tricky songs and count the
+       *distinct* tabs.
+    6. **Open strings** (found by F03's `--analyze`, 2026-09-27): with default weights an open
+       string scores no better than a fretted note in the sweet spot. An open-G riff scored
+       the same in OPEN_G (all open) as in OPEN_E (a barre at fret 3). `--prefer-open` only
+       penalizes fretting a pitch that exists as an open string.
+  - **Profile finder**: the tab is piecewise constant in the weights. So:
+    1. sample settings widely (log scales, flags included);
+    2. decode each and drop duplicate tabs (a few dozen distinct tabs expected per excerpt;
+       check);
+    3. scottvr ranks tabs, not settings, or picks between pairs;
+    4. take the setting at the centre of the winner's region as the style profile, saved as a
+       `.gtrsnipe` profile file.
+
+    Richer options: preference-based Bayesian optimization, or the structured perceptron
+    trained on his picks (no community tabs to curate). Check that each profile transfers to
+    a second song of the same style.
+
+### M01, first pass (2026-11-04): the audit from the code, and the sweep
+
+**The tool.** `gtrsnipe-research sweep SONG... [--probes] [--sample CORPUS:N] [--knobs a,b]
+[--pair A,B ...] [--tabs DIR] [--json FILE] [-v]` varies one mapper knob at a time over a ladder (weights at
+0, 1/8 … 16 × the default; zero-default bonuses at 0, 1, 3 … 3000; the integer and flag
+knobs over their ranges), fingers each input under each setting, and counts the *distinct*
+tabs. `--tabs` writes every distinct tab out, so the judging is done on tabs, not weights.
+`--probes` adds seven constructed passages, one scorer question each. The sweep also checks
+that doubling every weight leaves every tab unchanged (it does: only the ratios decide) and
+counts fingerings chosen past `unplayable_fret_span`.
+
+**The exchange rates, read off `_score_fingering` with hand travel as the unit.** They are
+the defaults restated, not a proposal; any one knob could be the unit. (The column divides
+by `movement_penalty`: a 1.7 there is a string switch at the defaults, not a proposed
+price for a fret of travel. That misreading started part of the discussion below;
+scottvr, 2026-11-04.) *scottvr, same day: a string switch costing more than a fret of
+travel is intentional. Staying on a fret, or moving by one, takes more effort from string
+to string than the same move up or down one string. For some common patterns it is a wash,
+and the prev / prev_prev terms, kludgy or not, tend to make it come out even; a penalized
+string hop is unlikely to force an unwanted fingering or forbid a desirable one where a
+player would call it even odds. Qualitative experience, not a measured claim; he is open
+to constructed cases that test it.* The position-run and open-vs-fretted probes are the
+closest existing cases: both flip when the switch rate drops to one fret (q5). Rounding them to
+whole frets isn't a scaling question (5/3 stays 5/3 at any scale): it means rounding the
+defaults themselves, which the sweep can then check for changed tabs.
+
+| knob | default | applied per | in frets of travel |
+|---|---|---|---|
+| `movement_penalty` | 3 | fret the *average* fret moves between fingerings | 1 (the unit) |
+| `string_switch_penalty` | 5 | string entering or leaving the set used (a single-note switch counts **2**) | 1.7, so 3.3 per single-note switch |
+| `high_fret_penalty` | 5 | fret the average sits above the sweet spot | 1.7; × 10 when a low string is used |
+| `fretted_open_penalty` | 20 | fretted note whose pitch is an open string (`--prefer-open` only) | 6.7 |
+| `fret_span_penalty` | 100 | fret of span inside a chord | 33 |
+| `sweet_spot_bonus` | 0.5 | fingering whose average is inside the window (a flat toll for leaving it; the penalty above is the graded one) | 0.17 |
+| `let_ring_bonus` (Asturias: 210) | 0 | string of the previous fingering left free | 70 at the Asturias setting |
+| the sentinel | 1000 | chord span past the limit (subtracted since 2026-11-04; was a flat **return**); diagonal span (subtracted) | 333 |
+
+**Three modelling facts, from the code.** Hypotheses for the discussion, not verdicts:
+scottvr's point stands that the open-string handling was deliberate in places (a sus shape
+slid up the neck keeps its open B and E; `--ignore-open` exists for exactly that), and the
+sweep, not a code read, says which knobs are wired to something.
+1. *No hand, no fingers.* A fingering is one number, its average fret; movement is the
+   difference of averages. Index on 5 then ring on 7 and a slide from 5 to 7 cost the same
+   two frets. A hand-position state (where the index sits; notes within reach cost no
+   travel) is the M06 question, not a weight.
+2. *Open strings have a position in the movement term and not in the span terms.* The
+   chord-span check drops them under `--ignore-open`, the diagonal check always drops them,
+   the movement term never does: open E then fret 7 is seven frets of travel, and an open
+   string in a chord pulls its average down.
+3. *A string switch is counted by symmetric difference*, so a single note changing string
+   costs two units, not one.
+
+**The sentinel couldn't rank** (fixed the same day; see q1 below). When no candidate fit the
+span limit, every candidate returned the same flat -1000 and the mapper picked arbitrarily (first in sort order, then whatever the
+path prefers), with the transition terms never consulted. Both mappers do it; the line dates
+from the July 2025 refactor, so it is not a Viterbi regression. Where it bites:
+- the sus-shape probe, x-5-7-7-0-0 slid to 7, 10, 12: with open strings counted, 0 of 108
+  candidates fit 4 frets, and the chosen fingerings span up to 19 frets (A19 with e0); with
+  `--ignore-open`, 6 fit and the tab is sane (span 2). One run of its seven chords takes
+  13.7 s (the cubic inner loop; parked);
+- Asturias v1's doubled unisons (G3 G3): the same pitch on two strings never fits 4 frets,
+  so all 12 candidates tie at -1000 and fret 10 on the A string beats fret 5 on the D string
+  because the flat return discarded the movement cost that would have ranked them. `--dedupe`
+  (as the wiki's final command does) removes the chord; `--ignore-open` fixes the open case.
+- Options discussed: subtract the sentinel instead of returning it (least-bad ranking, as
+  the diagonal check already does); or keep the hard rule and make the no-fit case explicit
+  in the tab (a marker, a warning naming the chord), since "no fingering fits your hand" is
+  information the player wants. Both, as of 2026-11-04 (q1).
+
+**The sweep on three real pieces** (the wiki's Mr Crowley organ intro, 168 notes; Asturias
+v1, 44; the full Bach prelude, 654), distinct tabs per knob over its ladder, pooled:
+
+| knob | verdict | live | distinct (sum) | nearest change from the default |
+|---|---|---|---|---|
+| `movement_penalty` | live | 3/3 | 15 | ×½ (all three), ×2 (two) |
+| `string_switch_penalty` | live | 3/3 | 17 | ×2 (all three), ×½ (two) |
+| `fretted_open_penalty` | live | 3/3 | 15 | ×½ (all), ×2 (two) |
+| `let_ring_bonus` | live | 3/3 | 17 | 1 to 10 |
+| `sweet_spot_low` | live | 3/3 | 10 | 2 |
+| `prefer_open`, `diagonal_span_penalty`, `optimizer` | live | 3/3 | 6 each | the flag |
+| `sweet_spot_high` | live | 2/3 | 12 | 9, 15 |
+| `fret_span_penalty` | live | 2/3 | 7 | 0 (Crowley), ×4 (Asturias) |
+| `ignore_open` | live | 2/3 | 5 | the flag |
+| `barre_bonus` / `barre_penalty` | rare | 1/3 | 5 / 7 | 30 / 10 (Crowley only) |
+| `high_fret_penalty`, `low_string_high_fret_multiplier` | rare | 1/3 | 4 | 0 (Bach only) |
+| `unplayable_fret_span` | rare | 1/3 | 5 | 3, 5 (Asturias only) |
+| `sweet_spot_bonus` | idle at the defaults | 0/3 | 3 | never (no lower edge, so no case) |
+| `sweet_spot_bonus` with `sweet_spot_low` 4 | live | 3/3 | 13 | 0 (all three), ×2 (two): the default 0.5 is a working balance point |
+| `high_fret_penalty` with `sweet_spot_high` 7 | live | 2/3 | 11 | ×½ and ×4 (Bach), ×¼ (Crowley) |
+
+The verdicts are about the *defaults*, not the knobs ("idle" = no ladder value changed a tab
+with every other knob at its default). A knob can be idle because its case never arises
+there, so the sweep also runs some knobs in the context they were designed for (the `@`
+entries: `sweet_spot_bonus@low4`, `high_fret_penalty@high7`, `barre_bonus@penalty10`).
+scottvr's reminder (2026-11-04): find out why the fence is there before taking it down. The
+sweet-spot edges were added so the bonus had a range to apply to; a player may set only the
+high edge, only the low edge, or how much the window matters; and the barre pair is two
+knobs on purpose, for the early user who wanted no barre shapes at all and would not have
+thought to type a negative bonus.
+
+On the six fast probes the picture is the same: `sweet_spot_bonus`, `barre_bonus`,
+`unplayable_fret_span` and `diagonal_span_penalty` never change a probe; `movement_penalty`,
+`string_switch_penalty`, `fretted_open_penalty`, `let_ring_bonus`, `sweet_spot_high` and
+`prefer_open` change four of six. Readings:
+- `sweet_spot_bonus` changed no tab on these three pieces at the defaults, and that is a fact
+  about the pieces: none of them ever had an above-window candidate close to winning, so no
+  size of bonus could show. The structure (corrected 2026-11-04, after I had wrongly called
+  the bonus redundant with the penalty): an above-window fingering must overcome the bonus
+  *plus* `high_fret_penalty` × its distance above the edge. The bonus is a flat toll for
+  leaving the window, the penalty a graded one, and they complement each other: with the
+  penalty small, a passage near the 19th fret goes to G17–G19 at bonus 0 and comes back to
+  e8–e10 at bonus 5. A bonus of 1000 with no bounds set is a real preference ("never leave
+  the neck below 12 whatever the movement saved"). With a lower edge the bonus is also the
+  only term telling inside from below, which is why `sweet_spot_low` 4 makes it live on every
+  piece here, and the default 0.5 then flips at 0 and at 1.0. Working as designed; scottvr
+  was right about this from the start (the edges were added after the bonus for exactly this).
+- The trade-off knobs (`movement`, `string_switch`, `fretted_open`) are live and flip
+  within ×2 of their defaults, i.e. the defaults sit near a boundary, which is what
+  hand-balancing one failure at a time would produce.
+- `let_ring_bonus` flips at 1–10 points on real pieces, so the Asturias 210 is a priority
+  (70 frets of travel: "ringing always wins"), not a trade-off.
+- `high_fret_penalty` only matters at 0 on these pieces; the ×10 low-string multiplier
+  likewise. Whether they matter on pieces that live above the 12th fret is untested.
+
+**The sus-shape probe under the sweep** (x-5-7-7-0-0 slid to 7, 10, 12 and back; seven
+5-note chords): at the defaults *every weight knob is dead*, because every candidate of every
+chord returns the flat -1000 and the weights never get a vote. Only `--ignore-open`,
+`unplayable_fret_span` 8 and `--optimizer greedy` change its tab. The sentinel doesn't just
+fail to rank; it switches the whole scorer off for that chord. (Measured before the q1 fix;
+after it, the probe's widest chosen span drops from 19 to 9 and the weights are live again.)
+
+**Ablation pairs** (`--pair A,B`: distinct tabs of B over its ladder, at each value of A), on
+the three pieces:
+
+| A | B | reading |
+|---|---|---|
+| `sweet_spot_low` 0 → 2 … 12 | `sweet_spot_bonus` | 1 distinct at 0; 4–6 at 2–9 (Crowley, Bach), 2 (Asturias); back to 1–4 at 12 |
+| `sweet_spot_high` 5 … 24 | `high_fret_penalty` | 7–8 distinct at 5, 4–6 at 7, 1–3 at 9, 1–2 from 12 up: the penalty is "rare" only because these pieces live below the 12th fret |
+| `high_fret_penalty` | `low_string_high_fret_multiplier` | Bach: live (5 distinct) when the penalty is small, 2 at the default; Crowley, Asturias: never |
+| `diagonal_span_penalty` | `let_ring_bonus` | 4–7 distinct off, 5–8 on: the t-2 term adds a tab or two but let-ring is live either way |
+| `barre_penalty` | `barre_bonus` | Crowley 2–4 at every penalty; Asturias and Bach 1 everywhere (no barres to find) |
+| `ignore_open` | `unplayable_fret_span` | Asturias only (the unisons): 3 distinct with opens counted, 2 without |
+
+So "dead at the defaults" has two causes to tell apart: a term with no case to decide
+(`sweet_spot_bonus`, `high_fret_penalty` on low-neck pieces), and a term that is too small
+to decide its case (none found yet). A full ablation, every pair, is 17 × 16 / 2 grids of
+up to 81 runs; on these pieces that is about ten minutes, so it can simply be run.
+
+**Replicating the wiki, both mappers** (each documented command run on the documented tab's
+own notes, `--refinger`; "same" = notes with the wiki's string and fret):
+
+| case | Viterbi | greedy | unplayable chosen |
+|---|---|---|---|
+| Mr Crowley, `--sweet-spot-high 8` | 138/168 | **168/168** | 0 |
+| Asturias v6, the final flag set | **45/45** | **45/45** | 0 |
+| Asturias v1 notes, defaults | 30/44 | 32/44 | 2 (the unisons) |
+| Asturias v6 notes, defaults | 26/45 | 26/45 | 0 |
+
+So the documented commands still do what the pages say, greedy reproduces the Crowley tab
+exactly (the 30 Viterbi differences are the docs-audit's known "22 of 70 chords"), and v0.2's
+*default* Asturias tab is not reproducible by either mapper today (the defaults or the
+candidate order have changed since; the two unison chords are unplayable-chosen in both).
+
+**For the discussion with scottvr** (his call, not mine):
+1. The sentinel: rank the no-fit case, or flag it, or both? *scottvr (2026-11-04): an obvious
+   oversight; for the pieces he was transcribing any choice happened to be as good as another,
+   so nothing stood out, but it is not something to leave to chance. Both: rank, and tell the
+   player, so that if the fingering still sucks they know the mapper had no real choice. The
+   message can live behind the existing debug flood or use a proper level; the verbosity
+   structure (today it is everything-or-nothing short of exceptions) is a parking-lot note.*
+   Done the same day: the scorer subtracts the 1000 and keeps scoring, so the least bad
+   fingering wins on the other terms; both mappers then warn, at the default verbosity, naming
+   the chord, the beat, the limit and the shape chosen ("No fingering of the chord at beat
+   3.125 (G3 G3) fits within 4 frets; chose the least bad: S3:F0 S4:F5 (span 5)."). Measured
+   on the three real pieces, Asturias v6 and the seven probes, both optimizers (22 tabs): 18
+   unchanged; Asturias v1 changes 4 of 44 notes (the two unisons go from G0 A10 to G0 D5,
+   widest span 10 to 5); the sus probe changes 20 of 35 (widest span 19 to 9, from the A19 e0
+   nonsense). Nothing else moved. Tests: `tests/unit/test_mapper_scoring.py`.
+2. Open strings in the movement term: a position, or none? His sus-shape example argues the
+   chord keeps a position while its open strings don't; a "last fretted position" rule gives
+   exactly that. *scottvr (2026-11-04): deliberate, and the intent was exactly the pull-down.
+   The term is a thumb on the scale, the cheapest one that needs no extra flag: "avoid a
+   big jump to an open shape from a fretted chord, but avoid it less the more of those
+   strings you are already playing open." An A barre at the fifth fret moving to open E
+   should be tipped toward something closer harder than an open Asus4 making the same
+   move. He hasn't run a transcription with debug on in a long while and won't swear it
+   holds in every case; there was no functional test for it.* The numbers from
+   `_score_fingering` say it does what he intended, by construction: 5-7-7-6-5-5 (average
+   5.83) to 0-2-2-1-0-0 (0.83) is 5.0 frets, 15 points at the default; x-0-2-2-3-0 (1.4) to
+   the same open E is 0.57 frets, 1.7 points. Each open string already held pulls the
+   pre-move average toward the open shape. The cost of the rule is the single-line case
+   (open E then fret 7 is seven frets each way); a "last fretted position" rule would keep
+   his chord behaviour and drop that, at the price of a state. *scottvr: yes, working as
+   designed and justified as it stands, for now, until better ways are sorted out (M06).*
+   The one undesirable effect, measured on the open-pedal probe: at the defaults the pedal
+   E is fingered at B5 on every beat and never open, because each open E is a trip to the
+   nut and back (seven frets each way); with `movement_penalty` 0 the mapper takes e0 every
+   time. Both tabs sit in one position and both are playable, so it is a preference, not
+   an error, and the asymmetry is the thing to remember: inside a chord the rule rewards
+   open strings, inside a fretted line it avoids them. `tests/unit/test_mapper_scoring.py`
+   pins the two chord numbers and the line case. *scottvr, same day, on that side effect:
+   this is the Asturias family of problems. `let_ring_bonus` and then the diagonal span
+   were added in the wiki walk-through by analyzing a failure and answering it with a
+   parameter, and they worked. 0-7-0-7-0-7 on one string is easy to play but not exactly
+   this; Bach is the other direction, too much on one string. `--single-string` only half
+   addresses it, built for an Angus Young lick or the Eruption tremolo, not a whole piece.
+   A weight instead of a boolean, or a second boolean, would resolve it and seems kludgy:
+   infinite tweakability ends with every song needing a profile, and someone who knows
+   enough to write that profile could transcribe by hand. Fine for now; it goes under M06
+   as the case a hand-position state should absorb, not a knob.*
+3. `sweet_spot_bonus`: working as designed. *scottvr (2026-11-04): the two forces (a flat toll
+   for leaving the window, a graded one per fret above it) go in the README beside the three
+   related options and in `--help`, not the wiki, which few people find and which he may
+   retire in a docs restructure (parked, with a tiered ffmpeg-style `--help`).* Done the same
+   day: README option text and the `--sweet-spot-bonus` help.
+4. `barre_bonus`/`barre_penalty`: two knobs on purpose (above); only the difference reaches the
+   score, which the help text could say. Nothing to change.
+5. Round the defaults to whole-fret rates and re-run the sweep to see what changes. *scottvr
+   (2026-11-04): go.* Measured on the 22 tabs (three real pieces, Asturias v6, seven probes,
+   both optimizers), against the defaults scaled to `movement_penalty` 1 (5/3, 100/3, 5/3,
+   20/3, 1/6), which fingers every tab the same except one: Bach under Viterbi moves 26
+   notes between two tabs that score *identically* under both configs, a tie broken by
+   float noise, so Bach has families of tabs the scorer cannot tell apart (noted; nothing to
+   do). Each change below was scored both ways under its own config to separate ties from
+   real changes:
+   - `high_fret_penalty` 5/3 to 2: nothing. `fret_span_penalty` 100/3 to 33: one Crowley
+     note, a tie. `fretted_open_penalty` 20/3 to 7 (only matters under `--prefer-open`):
+     nine Bach notes, real but 0.3 points.
+   - `string_switch_penalty` 5/3 rounded up to 2: real on Crowley/Viterbi (14 notes) and
+     Asturias v6/greedy (4); the bonus value (1/6, 0 or 1) changes nothing on top, as
+     expected with no lower edge.
+   - truncated to 1 instead (scottvr's question): a switch then costs exactly one fret, and
+     eight tabs flip, all real: Bach +96 switches under Viterbi (92 notes), Asturias v6 +16
+     (8 notes), the position-run and open-vs-fretted probes too. That is the behaviour the
+     intentional 5-vs-3 is there to prevent (his note above the table).
+   Decision: the originals are whole numbers already (3, 5, 100, 5, 20, 0.5); the fractions
+   only appear in the frets-of-travel column. Nothing to round; q5 closes with no change,
+   and the two tables above now carry the cost of each rounding should it come up again.
+   *scottvr: no design notes survive and he won't claim intelligent design, but trial and
+   error may be why the values are as large as they are: a fret at 3 instead of 1 leaves
+   room for nuance, a switch at five thirds of a fret, in whole numbers.*
+6. M02 is already in the table: `optimizer` is live on every input. The corpus comparison
+   (`--sample nottingham:N`, Lakh for chords) is one command away, once the cubic loop is
+   fixed or the sample avoids dense chords. *scottvr (2026-11-04): go.* Done the same day;
+   results in the M02 section below.
+
+### M02, first pass (2026-11-04): Viterbi vs greedy across five corpora
+
+The greedy mapper now reports its path score under the same objective as Viterbi (the sum
+of its chosen fingerings' scores), so the two are compared score to score, not by proxies
+alone. `gtrsnipe-research optimizers --sample nottingham:100 essen:100 mtc-fs:100
+lakh-clean:100 pop909:50` (seed 1, defaults, `--data` at the corpus root) reproduces this;
+the run below used the same code paths from a scratch script. A jump is a change of
+average fret of five frets or more. 450 tunes, 132,326 notes.
+
+| corpus | tunes | notes | same tab | Viterbi better | worse | gain per note, mean (max) | travel g to v | jumps g to v | switches g to v | seconds g to v |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Nottingham | 100 | 10,385 | 7% | 93% | 0% | 0.35 (1.30) | 2.09 to 2.02 | 605 to 594 | 2,228 to 2,202 | 0.3 to 0.9 |
+| Essen | 100 | 5,027 | 20% | 77% | 0% | 0.29 (1.40) | 1.69 to 1.64 | 217 to 210 | 1,188 to 1,124 | 0.1 to 0.5 |
+| MTC-FS | 100 | 7,522 | 25% | 74% | 0% | 0.32 (2.47) | 1.78 to 1.72 | 449 to 436 | 1,584 to 1,564 | 0.2 to 0.7 |
+| Lakh clean | 100 | 92,888 | 1% | 99% | 0% | 0.41 (3.78) | 2.28 to 2.16 | 10,482 to 9,320 | 83,644 to 82,758 | 14 to 734 |
+| POP909 | 50 | 16,504 | 12% | 88% | 0% | 0.29 (1.09) | 1.84 to 1.85 | 901 to 1,037 | 3,942 to 3,310 | 0.8 to 6.2 |
+| all | 450 | 132,326 | 13% | 86% | 0% | 0.34 (3.78) | 1.95 to 1.88 | 12,654 to 11,597 | 92,586 to 90,958 | 16 to 743 |
+
+What it says:
+- **The improvement generalizes, and it is never a loss.** Viterbi is worse on no tune (it
+  can't be: first-order Viterbi is exact on this objective at the defaults, with the t-2
+  term off), equal on 13%, better on 86%. The mean gain is a third of a point per note, a
+  ninth of a fret of travel per note at the defaults; the median per corpus is 0.18 to
+  0.36. The largest gains are on long Lakh melodies (3.8 per note on one 489-note tune).
+- **The proxies follow the objective, mostly.** Travel and big jumps fall by 4% and 8% over
+  the set, switches by 2%. POP909 is the exception: Viterbi makes *more* big jumps there
+  (1,037 against 901) and the same travel, while cutting switches by 16%: the objective
+  prices a switch at five thirds of a fret, so on those tunes it bought fewer switches with
+  more travel. "Fewer big jumps" is therefore not a property of the optimizer; it is a
+  property of the weights, which Viterbi merely optimizes better. M03's difficulty
+  measure, not M02, is where a jump count belongs.
+- **Time.** On melodies Viterbi costs three to five times greedy (a second a tune at most).
+  Lakh's dense tunes are where the cubic inner loop (parked) bites: 734 s against 14 s over
+  100 tunes, 187 s on one 4,032-note tune.
+
+Raw results, the 81 distinct tabs and the replicated tabs are in the session scratchpad
+(`sweep/real.json`, `sweep/tabs/`, `repro/`); they stay off the repo because the wiki tab
+and the corpus pieces are not ours to ship.
+
+### Hand position (2026-11-07): scottvr's note, and the index-finger proxy measured
+
+**The note** (scottvr, a phone note found and copied to
+`docs/note-scoring-hand_on_neck_position.txt`; prompted by DOCS-AUDIT WK-5, "`--movement-penalty`
+is per fret the hand's average position moves"). The points, in his order:
+1. Hand position changes only between notes, never inside a note or chord. A chord's average
+   fret is a center point, not a change; if a center is wanted at all it should be the median.
+2. The hand is where the index finger is. The forearm passes under the neck, the wrist bends
+   to bring the fingertips down onto the face of the neck, so the index finger is a proxy for
+   the wrist and the hand is fixed to the wrist. Reach to higher frets is governed by fret
+   span, and the span settings exist for hand size; both point at the lowest fretted fret as
+   the position, not the mean.
+3. This only matters once scoring considers hand position. Movement is scored today from
+   prev and prev_prev by fret arithmetic, not by hand position except through that average.
+   Not all increments are alike: A major as a full barre at 5 (5-7-7-6-5-5) to B at 7
+   (7-9-9-8-7-7) moves the hand two frets with the shape unchanged; it is easy for an
+   experienced player, as easy as a single-string 5-to-7 slide, harder than a hammer-on.
+4. The right transition cost is probably: how far the shape changes (zero for the barre
+   slide; one finger lifted for A to A minor), how far the hand moves (two frets there), and
+   the chord's complexity, because keeping a hard shape together while moving it is harder,
+   likely scaling with complexity, probably multiplicative rather than additive, possibly on
+   a log scale. The difficulty of the barre slide may not be exactly zero, only negligible
+   until the shape is complex enough.
+5. Direction may matter: the under-and-around routing of the forearm means wrist stress
+   changes differently toward the nut and toward the bridge. Both ends are harder; how much
+   is player dependent. One sweet spot for single notes and chords is probably enough, but
+   write it down when it is decided.
+6. The Mr Crowley intro, full chords with single fretted notes between them, is the script
+   to walk through if hand (neck position) scoring and finger scoring turn out to be two
+   things.
+
+**What Claude knew, and didn't.** Fact 1 of the M01 audit already says it from the code: a
+fingering is one number, its average fret, there is no hand and there are no fingers, and a
+hand-position state ("where the index sits; notes within reach cost no travel") is the M06
+question. WK-5 is a statement about the code, and the code never moves a chord inside
+itself: the average is used only in differences between consecutive fingerings (the movement
+term) and in the sweet-spot test (where on the neck a fingering sits). So point 1 was
+understood, and the audit's wording is right. Points 2, 4 and 5 were new: the anatomical
+argument for the index finger (not "the lowest fret" as a convenience but the wrist's proxy,
+with reach extending upward from it only), the nut-side discomfort as a separate thing from
+the bridge-side one, and the multiplicative complexity scaling. Without the note Claude would
+have reached for the mean or for the fret interval, with reach counted symmetrically.
+
+**Measured** (`runs/hand-position-2026-11-07/handpos2.py`, defaults, Viterbi): three rules
+for a chord's position in the movement and sweet-spot terms, with single notes scored as
+shipped so that the open-string behaviour decided in q2 is untouched: the mean (shipped), the
+median, and the lowest fretted fret ("index", all-open counted as the nut). Changed notes
+against the shipped tab:
+
+| piece | notes | median | index | why |
+|---|---|---|---|---|
+| Mr Crowley (wiki) | 168 | 22 | 14 | the fretted line between chords moves to the next string down, see below |
+| Asturias v1 | 44 | 0 | 3 | an open B before a G4+B0 chord gets fretted at G4 (a tie under the mean, broken toward the chord's index) |
+| Asturias v6 | 45 | 0 | 0 | |
+| probe: sus-slide | 35 | 18 | 4 | median: x-5-7-7-0-0 has median 5 and the open strings stop pulling the shape toward the nut, the behaviour confirmed in q2 |
+| probes: wide-chord, open-pedal | 22 | 0 | 0 | |
+| 5 Nottingham tunes | 412 | 0 | 0 | single notes, by construction |
+
+(A first version that also took open single notes to have no position changed 433 notes in
+34 of 50 pieces; all of that is q2's open-string rule, not this question, and the script
+`handpos.py` keeps it for the record.)
+
+The Crowley bar is the case the note asked for. The intro opens x-5-7-7-6-x (index at 5,
+mean 6.2), then the line E3 F3 G3, then 5-7-7-5-5-x (index at 5). Shipped: the line is
+A7 A8 A10. Index rule: D2 D3 D5. Read as a hand: from the index at 5, A7 and A8 are within
+reach (ring and little finger, no movement); A10 needs the hand at about 7; the hand goes
+5 to 7 and back, two frets each way. The index proxy without a reach rule charges A7 two
+frets and A10 five and so prefers to take the whole hand down to the second position, where
+D2 D3 D5 sit under it. The mean got the better line by luck: 6.2 is near 7. So swapping the
+mean for the index is a regression on his own script piece, and the proposal that works is the
+note's two halves together: position is the index finger, and notes within the span above
+it cost no travel. That is the hand-position state of fact 1 and M06, not a change of
+statistic. The note's own examples under the two rules, transition cost at the defaults:
+A to A minor (lift one finger) 0.5 against 0; A with the little finger added on e7 1.0
+against 0; A to B as a barre slide 6 under both; open A (x-0-2-2-2-0) to the A barre 18.9
+against 14.
+
+**Where this leads** (his call):
+1. Mean to index alone: no. Index plus reach: yes, as the M06 hand state. It stays a
+   function of the previous and the current fingering, so first-order Viterbi stays exact
+   (the landmine guard in `_score_fingering` is about t-2 only).
+2. His transition formula fits the exchange-rate framing and is allowed to be multiplicative
+   as long as it reads only prev and current. Shape change needs finger assignment, which
+   nothing has today (M06 gives it); position change is the index delta beyond reach;
+   complexity is span, fretted count and barre. One caution: `fret_span_penalty` at 100 per
+   fret is charged on every onset already, the largest term in every real score (Crowley
+   -6844 is mostly span), so a complexity factor on movement would count span twice unless
+   span's own role is rethought in the same pass.
+3. Direction. The code's sweet spot has only a bridge-side penalty (`high_fret_penalty`
+   above `sweet_spot_high`; below `sweet_spot_low` nothing happens, which is why the sweep
+   found that knob dead on real pieces). A nut-side twin is a one-line term; whether it is
+   on is player dependent, so it belongs to a profile with the default off. Nothing measured
+   says single notes and chords need different sweet spots.
+4. Median: the worst of the three. It keeps the mean's center-point meaning and drops the
+   open-string pull-down.
+5. The Crowley intro stays the test piece for hand-versus-finger scoring; the bar above is
+   the first case.
+
+**Weights are path-dependent** (scottvr, 2026-11-07, on reading the mean/median/index numbers
+above). The weights and options arrived one at a time, from a few to dozens quickly, each
+tuned against the scorer as it stood that day. So a later weight that looks right today may
+be an order of magnitude too heavy, or unneeded, only because of how an earlier one was set
+before it arrived; and a change we expect to improve a tab can come out worse for the same
+reason. Keep this in mind for every knob-tuning and ablation run in this phase: a
+one-knob-at-a-time sweep (which is how the weights were born) can only confirm the path; the
+pair sweeps (`--pair A,B`) and refitting the earlier weights when a term is changed are the
+tests that can find it. *Claude:* the exchange-rate table in M01 is the map of today's path,
+and `fret_span_penalty`'s double role (span charged on every onset, and again if complexity
+scales movement) is the first candidate.
+
+**Time-scaled movement cost** (scottvr, 2026-11-07, deciding Claude's question from the M03
+survey: implement it, in the scorer as well as the measure; a gut feeling brushed off several
+times during development, now possible because a gtrsnipe-generated tab's rhythm is exact
+since v0.8.0). His statement: the penalty for a hand move rises as the time from the end of
+note or chord 1 to the start of note or chord 2 falls; with a tempo the time is exact, without
+one it is relative (MIDI reading has a default tempo, which will do); for tabs in the wild
+without the gtrsnipe header the dash counts are not reliable, so the term is either invariant
+to that or gated: automatic when the header says the layout is ours, a user flag otherwise.
+*Claude, two notes for the design:* (1) Hori & Sagayama scale by the onset-to-onset interval;
+the end-to-start gap he names is the time the hand is actually free, and it is zero for
+every held or legato line (let-ring, the Asturias pedal), so the two measures differ exactly
+where the scorer already has terms. Propose: onset-to-onset as the base with a floor, and
+end-to-start measured alongside on the real pieces before choosing. *scottvr, same day:
+end-to-start, and it does not conflict. A fretted note lasts exactly as long as the finger
+stays on the fret, because lifting the finger ends the note; so the gap from the end of one
+note to the start of the next is the time the hand truly has. Pedal notes are open or stay
+in one position, so no movement is charged there whatever the gap.* Decided: end-to-start.
+Where the gap is zero and the hand must move, the cost is real (the player cuts the note or
+arrives late), which onset-to-onset would hide. Two consequences: the term needs note
+*ends*, which MIDI has and **no tab does, ours included** (scottvr's correction, same day:
+a tab's dashes give exact onsets and nothing else; a note's end is a reading convention,
+legato to the next onset, staccato for the grid unit, or string mode until the string is
+struck again, and the `// Lengths:` letters are note values, not ends). So on any tab the
+end-to-start gap is undefined unless the layout gains an end mark (parked); and score-derived MIDI often
+holds every note to the next onset, so a floor on the gap, not a zero, is the practical
+minimum. *scottvr, later: since this contradicts the literature we searched, call the
+departure out explicitly, with evidence: build both time bases and compare the tabs; where
+they differ he plays them, which should settle it. For tabs in the wild he expects
+approximate (dash-derived) to beat off, tested the same way.* (2) Backlog M08; the header
+documentation is H09.
+
+## M03: a tab difficulty measure
+
+- **A tab difficulty measure** (scottvr, 2026-09-30). Tab sites sort by difficulty labels
+  that uploaders assign by opinion. Objective *complexity*, measured from the tab, could serve
+  as a proxy for difficulty, which is complexity relative to a player.
+  - Ingredients we already have: F06's discomfort and F03's per-note mapper score, hand
+    travel and big jumps (the naive-vs-gtrsnipe comparison), fret range. To add: notes per
+    second at tempo, stretches, chord changes per bar, barres, techniques, position shifts.
+  - Validation: expert-graded repertoire (graded exam syllabi such as Rockschool, Trinity,
+    ABRSM-style guitar grades) gives an ordering to test against (rank correlation), which is
+    better ground truth than uploaders' labels. Tab-site labels could be a second, noisier
+    check.
+  - A literature search comes first: automatic difficulty estimation exists at least for
+    piano, and some for guitar. Relates to the weights audit's "whole-tab difficulty
+    meta-score" and "difficulty before transcription" above.
+  - **Literature pass done 2026-11-07:** [`LITERATURE-difficulty.md`](../research/literature/LITERATURE-difficulty.md).
+    Ten papers (six read in full), three on guitar. The ingredients it supports, the
+    aggregation (means and the maximum, not totals), the validation (rank correlation
+    against the RCM 2018 syllabus list, 413 pieces in nine levels, matched to free tabs)
+    and the ceiling (MSE about 1 on a 10-level scale, at annotator noise) are in its §4.
+    Two of the guitar papers define hand position as the index finger, as scottvr's
+    hand-position note does; one scales the movement cost by the time available.
+
+### M03, first cut (2026-11-07): the descriptors, and what the two time bases do
+
+`gtrsnipe-research difficulty SONG... [--probes] [--sample CORPUS:N] [--both] [--reach N] [-v]`
+(`gtrsnipe/research/difficulty.py`). A tab is read as onsets with the fingering it states (a
+`.tab`) or the mapper's (anything else, or `--refinger`). Per onset: the index fret (lowest
+fretted), the hand position, fingers down (the lowest fret's notes counted once, an index
+barre), span, barre, the hand's shift in frets, the gap it had for it, the move rate in frets
+per second, the shape change (string-fret pairs that differ), the inter-onset time and the
+technique marks. Per tab: mean, quadratic mean and max of each; shifts per minute; position
+range; chord and barre shares; repetitiveness (Lempel-Ziv on the shape sequence); notes per
+second; and a provisional index with hand-set weights that nothing depends on.
+
+**The hand model was necessary before any number meant anything.** With position = each
+onset's lowest fretted fret (the plain index proxy), a jig at the fifth position showed 130
+hand shifts per minute and a mean shift of 1.7 frets per note, because every note on another
+fret counted as a move. The lazy hand of fact 1 (M01) fixes it: a shape anchors the index at
+its lowest fret; a single note leaves the hand where it is while it lies within `reach` frets
+above the index (default 3, four fingers on four frets), else the hand moves the least
+distance that fits. That alone took the jig to 54 shifts per minute and Crowley from 60 to
+17, which is what a player would count. `--reach 0` reproduces the proxy for comparison. This
+is the first working piece of M06's hand state, on the measure side only; the scorer still
+has no hand.
+
+**The two time bases (M08), first numbers.** On every input we have, the end-to-start base
+sits on its floor almost everywhere, so its move rate is just shift divided by the floor
+(0.05 s): Crowley's mean move rate is 13.4 frets per second end-to-start against 1.7 onset to
+onset, and its hardest move 80 against 12.8. The reason is the inputs, not the rule: a tab
+states no note ends (its durations are the dash counts to the next note), the folk corpora
+hold every note to the next onset (Nottingham releases 0.1% of notes early, Essen 3%, MTC
+2%), and the mapper's probes are built that way too. The only corpus with real releases is
+POP909 (67% of notes end before the next onset, median duration 0.76 of the interval); Lakh
+has some (25%). So the M08 comparison cannot be run on tabs or folk tunes at all: it needs
+POP909-like input, or MIDI of real performances, and even there the floor is the knob that
+decides most of the difference. Two consequences: (1) for tabs in the wild the end-to-start
+base is not merely approximate, it is undefined, and onset to onset is the only rule
+available there; (2) the same is true of a gtrsnipe tab (scottvr's correction above: the
+layout carries onsets, and ends are a reading convention), so an end mark in the layout is
+what it would take, which is parked; H09 still holds for the onsets. The scorer-side comparison (where fingerings may differ) is
+still to run, on POP909.
+
+**Other things the first run shows.** The as-written tabs that predate v0.8.0 read with
+approximate rhythm (`~rhythm` in the table), and their seconds are not to be trusted:
+Asturias v1 comes out as 44 notes in 3.9 s, so every time-based descriptor of a tab without
+`// Rhythm:` is unreliable, exactly the gating scottvr described. Crowley (as written, 70
+onsets): 1.7 fingers down and a 0.8-fret span on average, 31% barres, hand never above 6.
+Asturias v6: half a finger, no span, hand at 4 at most, repetitiveness 0.75. The provisional
+index ranks the sus-slide probe hardest, which is right (wide shapes moving fast), and the
+open-pedal probe at the bottom.
+
+**M08, scorer side (2026-11-07).** Built: `--movement-time-base onset|end` multiplies the
+movement penalty by `--movement-reference` (0.5 s) over the gap, floored at
+`--movement-min-gap` (0.05 s); off by default. The gap is a per-stage constant, so Viterbi
+stays exact (the landmine test now pins the fourth argument). The generators pass the
+song's tempo; `--analyze`, the chord charts and the player still map at the default 120.
+First run (`runs/m08-2026-11-07/`, 60 pieces, 25,497 notes; every input at tempo 120):
+
+| input | onset base changes | end base changes | onset vs end differ |
+|---|---|---|---|
+| Mr Crowley (168 notes) | 18 | 4 | 18 |
+| Asturias v1 / v6 | 0 / 11 | 0 / 11 | 0 / 0 |
+| probes (7) | 3 pieces, 0–2 notes | same | position-run only |
+| POP909 (18 tunes) | 13% of notes | 33% | on every tune |
+| Lakh clean (15) | 14% | 20% | every tune |
+| Nottingham (10) | 9% | 42% | every tune |
+
+What it says so far: the onset base is a moderate thumb on the scale (a tenth of the notes
+on melodies, a tenth of Crowley). The end base on inputs that hold every note to the next
+onset (tabs, folk, the probes) is not a timing rule at all but a ten-fold movement penalty,
+which is why it rewrites 42% of a Nottingham tune; only POP909 and Lakh, where notes are
+released early, test what it is for. The G2-to-B2 unit case shows the intended effect: with
+a quarter second the mapper takes the string switch instead of a four-fret move, and with a
+whole second it moves again. The listening set for scottvr is in `runs/m08-2026-11-07/tabs/`
+(Crowley, Asturias v6, two probes, four POP909 tunes, three tabs each) with a README on what
+the comparison can and cannot show. Open: the reference and floor are guesses; the floor is
+the whole story wherever notes are held, so a release-aware input (POP909, performance MIDI,
+or a tab layout with an end mark) is the only ground on which end-to-start can be judged.
+
+**First validation (2026-11-07): 49 classtab tabs against their RCM level.** The RCM 2018
+syllabus list (414 pieces, nine levels) matched by composer, opus and title against the
+classtab.org archive (3,977 ASCII tabs, the monthly zip, local under `data/classtab-zip/`)
+gave 50 sure matches (score 4 or more; 65 weaker candidates await a hand check), spread over
+every level, 3 to 9 per level. Reading them needed B24 (a fifth of classtab's tabs open their
+string lines with a bare `|` or no label; fixed, 98% read now), and the tabs' own fingerings
+check out against classtab's MIDI (exact or found inside the MIDI with repeats expanded for
+26 of the 37 that have one; the rest differ in content, an accidental or a pickup bar).
+Spearman's rho of each descriptor against the level, onset time base, tempo 120 throughout
+(`runs/m03-graded-set-2026-11-07/first-correlation.json`):
+
+| descriptor | rho | | descriptor | rho |
+|---|---|---|---|---|
+| hand move rate, mean | **0.71** | | max hand position | 0.67 |
+| hand move rate, max | **0.71** | | position range | 0.67 |
+| provisional index | 0.66 | | shifts per minute | 0.66 |
+| span, max | 0.64 | | length in onsets | 0.60 |
+| shift, mean | 0.59 | | barre share | 0.57 |
+| fingers down, mean | 0.54 | | notes per second | 0.47 |
+| length in seconds | 0.44 | | span, mean | 0.38 |
+| notes per onset | 0.26 | | chord share | 0.18 |
+| shape change, mean | 0.12 | | repetitiveness | −0.06 |
+
+All of the first twelve are significant at p < 0.001 on 49 pieces. What it says, with the
+caveats of a first pass: the hand's movement (how far, how fast, how high) is the strongest
+single family, above Ariga et al.'s 0.55 for index-finger movement on 50 rated tabs; the
+hand-set index lands at 0.66 without any fitting; the two descriptors borrowed from the
+rubric literature that do nothing here are shape change and repetitiveness (the RCM books
+are all short, repetitive study pieces, so there is no spread to correlate). Length
+correlates too (0.60), which is a confound to keep in view: graded repertoire gets longer
+as it gets harder, and the measure should not be allowed to learn that. Needed before any
+weight is fitted: the 65 candidates checked by hand, Trinity or ABRSM as a second list,
+real tempi (every classtab tab is read at 120), and the 49 looked at for mismatched
+matches (a wrong opus number is a wrong level).
+
+**gtrsnipe's fingering against the editors' (2026-11-07; scottvr's question).** Each
+classtab tab's notes re-fingered by the mapper at the defaults and compared with the tab's
+own fingering (`runs/m03-graded-set-2026-11-07/fingering-vs-classtab.json`):
+
+| | 44 graded tabs | 184 sampled tabs |
+|---|---|---|
+| notes identical (string and fret), median | 51% | 57% |
+| mapper's path score above the tab's, per note | 16 (median 12) | 36 (median 22) |
+| tabs where the editor's fingering scores higher | 0 | 0 |
+| hand move rate, mean (frets/s): editor vs mapper | 0.63 vs 2.29 | 1.58 vs 2.77 |
+| highest hand position: editor vs mapper | 5.2 vs 10.3 | 9.0 vs 11.0 |
+| open-string share: editor vs mapper | 39% vs 14% | 27% vs 12% |
+| fret span, mean: editor vs mapper | 0.18 vs 0.25 | 0.30 vs 0.33 |
+
+So: half the notes agree. By the scorer's own objective the editors' fingerings are always
+worse, by a lot (the mapper is the optimum of that objective, so the only question was by
+how much). By the hand descriptors, the ones that correlate 0.7 with the grade, the editors'
+fingerings are much easier: a third of the hand movement, half as high on the neck, nearly
+three times the open strings. The scorer optimises something that is not hand ease, and the
+three places it differs from the editors are the three places M01 already flagged: open
+strings cost a trip to the nut in the movement term (q2's side effect, here at corpus
+scale), the sweet spot is flat from 0 to 12 so nothing prefers the low positions, and the
+exchange rate between a string switch and a fret of movement. The caveat is the idiom:
+classical editions favour open strings and first position by tradition as well as ease, so
+"agrees with the editors" is not the whole target; but 3,000 human fingerings are now the
+training and test set the parked learned-weights idea was waiting for, and agreement with
+them is a metric the sweep tool can carry (first ablation below).
+
+**Which knob closes the gap** (same day; agreement = notes with the editor's string and
+fret, over the 44 graded tabs; `runs/m03-graded-set-2026-11-07/agreement-ablation.json`):
+
+| setting | agreement | open strings | mean highest fret |
+|---|---|---|---|
+| defaults | 52% | 14% | 12.0 |
+| `--prefer-open` | 78% | 30% | 10.4 |
+| `--sweet-spot-high 5` | 74% | 20% | 7.6 |
+| `--sweet-spot-high 4 --prefer-open` | **87%** | 33% | 7.0 |
+| `--sweet-spot-high 5 --prefer-open --string-switch-penalty 2.5` | 86% | 32% | 7.1 |
+| movement 6 or 12; string switch 2.5 or 1; let-ring 3 | 55–56% | | |
+| movement 1; string switch 10 | 47% | | |
+| span 25 or 400; barre bonus; high-fret penalty 20; sweet-spot bonus 5 | 52% (dead) | | |
+| the editors themselves | 100% | 39% | 5.2 |
+
+*scottvr asked how the wiki's final Asturias command would do, since with three pieces tabbed
+it is the option set he would have called a classical profile.* On the same 44 tabs: 71%
+(open strings 29%, highest fret 9.8); its earlier form with the sweet spot at 4 to 9: 73%;
+the same set with the sweet spot ending at 5 instead: 84.5%. So of its ten options, the one
+doing the work is `--prefer-open`; the heavy movement penalty (20), the free string switch
+and the let-ring bonus (210) add nothing the editors would recognise, and the thing it
+lacks is the low sweet-spot ceiling. Two existing knobs, both off or flat by default, take
+the mapper from agreeing with the editors on half the notes to agreeing on seven in eight: prefer open strings, and a sweet
+spot that ends at the 4th or 5th fret instead of the 12th. Nothing else moves it more than a
+few points, and the movement and string-switch exchange rate is dead on this set either
+way. This is the first measurement against human fingerings the project has had, and it says
+the defaults were tuned to something other than how editors finger these pieces. The
+decision it asks for is scottvr's, with the idiom caveat above and the path-dependence
+warning: whether the defaults change (or a "classical" profile ships), and whether the same
+holds on non-classical tabs. **On the broader 184-tab sample** (the whole archive's spread,
+Liszt and Zelda included; editors' open-string share 27%) it holds: defaults 59%,
+`--prefer-open` 71% (162 pieces better, 16 worse), `--sweet-spot-high 5` 70% (160/18), the
+two together 76.5% (166/16, the worst loss 12 points on a Handel suite). What is left to
+test is a corpus that is not classical guitar.
+
+**The option set as a 2^k sweep** (same day; scottvr asked for every subset of the wiki's
+Asturias command, each knob alone, each pair, and so on, so that a small gain is not written off
+because another knob cancels it; `runs/m03-knob-sweep-2026-11-07/`, `sweep.py` and `analyze.py`).
+Ten scoring knobs from the command (string switch 0, prefer-open, span 3, high-fret 50,
+fretted-open 10, movement 20, let-ring 210, diagonal span, sweet spot 4 to 9), 1,024 subsets,
+on the three original pieces, agreement against the tab each wiki page settled on. *Caveat
+that governs this run:* those three references are earlier gtrsnipe outputs scottvr accepted,
+not editors' fingerings, so the sweep measures how far today's scorer is from those settings
+(Asturias v6 reproduces exactly: the full set and `ring210+diag` both give 100%; Bach was made by
+v0.2's greedy mapper with the sweet spot ending at 4, which is not in this set, so nothing
+reaches 100%). The editors' version of the same sweep, on the 44 graded tabs, is the one that
+counts and is in the same folder (`graded.json`).
+
+| three originals, pooled by note | agreement |
+|---|---|
+| defaults | 51% |
+| best single: `--string-switch-penalty 0` | 75% |
+| best pair: `--string-switch-penalty 0 --prefer-open` | 80% |
+| best triple: the pair plus sweet spot ending at 9 | 81% |
+| any larger subset | no better; the full ten-knob set 77% |
+
+**The same sweep against the editors** (44 graded classtab tabs, 2026-11-07, agreement with
+the editor's string and fret, pooled by note; `graded.json`, all 1,024 subsets; the 256 with
+let-ring and diagonal-span both on are the second-order Viterbi quarter, which took most of
+the run until B25):
+
+| 44 graded tabs | agreement |
+|---|---|
+| defaults | 52% |
+| best single: `--prefer-open` (better on all 44 pieces) | 78% |
+| best pair: + sweet spot ending at 9 | 81.5% |
+| + string switch 0 | 83% |
+| + high-fret 50, + span 3, + diagonal span | 83.3 / 83.4 / 83.6% |
+| the two-knob set from the one-knob ablation, sweet spot ending at **4** (not in this set) | 87% |
+
+Main effects over all contexts: prefer-open **+13 mean, never below +1.9, helps in every one of
+378 contexts**; sweet spot ending at 9 +5, helps in all 381; high-fret 50 +1.0, never hurts;
+span 3 +0.9, never hurts; diagonal span +1.4 (hurts in 18 contexts, and −0.6 on top of the
+best pair); string switch 0 +1.3 (+7.8 alone, +1.7 once prefer-open is on: a substitute);
+movement 20 **−3.5 mean**, +4.7 alone but −9.5 in interaction with prefer-open (a heavy
+movement penalty keeps the hand from leaving for the open strings); let-ring 210 **hurts in all
+252 first-order contexts** (−9.6 mean); sweet spot low 4 hurts in all 380; fretted-open 10
+hurts wherever it acts (−2.1; it weakens prefer-open). The marginal path flattens after four
+knobs: prefer-open, the ceiling, string switch 0, high-fret 50, then tenths of a point.
+*With the second-order quarter in:* no subset containing let-ring enters any best-of-size
+row; let-ring 210 hurts in 359 of 512 contexts and helps in 143, and the 143 are almost all
+contexts with diagonal-span on (let-ring × diagonal +9.5 on the editors too, the same pair
+the originals showed). Diagonal span's mean effect rises to +6.1 because it repairs let-ring's
+damage, not because it helps the editors on its own (−0.6 on top of the best pair). Span 3
+never hurts (+2.4 mean) and pays only alongside diagonal span (+4.8 interaction).
+
+*Originals vs editors.* The three originals' best single knob was string switch 0 (+24) and
+they rewarded movement 20 and let-ring 210 as substitutes for it; the editors' best single is
+prefer-open (+25), they take string switch 0 only as a small third knob, and they reject
+movement 20 and let-ring 210 outright. The "small gains that survive on top" (scottvr's
+question) are, on the editors: the sweet-spot ceiling (+3.7 on top of prefer-open), string
+switch 0 (+1.3 on top of the pair), high-fret 50 (+0.5, never negative). Everything else is
+zero or negative once those are in.
+
+**The ceiling alone** (same day; `ceiling.py`, `ceiling.txt`: sweet spot ending at 3 to 12, with
+and without `--prefer-open`, with and without string switch 0; agreement with the editors on
+the 44 graded tabs, and with the three originals' own tabs):
+
+| ceiling | graded, plain | graded, + prefer-open | graded, + both | Crowley (own tab) | Bach (own tab) |
+|---|---|---|---|---|---|
+| 3 | 85.6% | 88.9% | **89.3%** | 66–68% | 96–99% |
+| 4 | 81.6% | 87.0% | 87.3% | 66–69% | 95–**99.8%** |
+| 5 | 73.8% | 85.4% | 86.2% | 68–75% | 92–96% |
+| 7 | 65.9% | 82.5% | 83.9% | 74–83% | 80–91% |
+| 9 | 59.5% | 81.5% | 82.8% | 74–**90.5%** | 60–83% |
+| 12 (default) | 52.4% | 77.7% | 79.4% | 74–90.5% | 42–82% |
+
+The editors' agreement is monotone in the ceiling all the way down to 3, the lowest tried: the
+ceiling by itself gets 86%, and prefer-open on top adds 3 more (it adds 25 at the default
+ceiling, so the two measure much the same thing, open strings pulling the mean fret down).
+Bach's own tab is reproduced at 99.8% by its actual command (ceiling 4, string switch 0).
+Crowley is the mirror image: it wants the ceiling at 9 or above and no prefer-open, and the
+low ceiling costs it a quarter of its notes. So the beginner/intermediate classical profile is
+"ceiling 3 or 4, prefer open, string switch low", the defaults are not that, and Crowley is
+the standing reminder of why.
+
+What the full factorial adds over the one-knob table (on the three originals):
+
+- **Interactions are real, and the let-ring knob is the one that needs company.** Let-ring
+  210 alone is erratic (helps in 281 of 512 contexts, hurts in 205, worst −10 points); with
+  `--diagonal-span-penalty` on, its effect is 9 points better on average (+26 on Asturias,
+  +11 on Bach). That pair is what made Asturias v6: together they reproduce it exactly,
+  neither alone gets past 71%.
+- **Three knobs substitute for each other.** String switch 0, movement 20 and let-ring 210
+  each take defaults to 64–75% alone, and each adds nothing or less once another is on
+  (switch × ring −6.5, switch × move −4.2, move × ring −3.2 points). They all fight the same
+  thing, hopping strings for a note the current string could play.
+- **Dead or conditional knobs:** high-fret 50 flat in 456 of 512 contexts (never hurts, max
+  +1.4); span 3 flat in 320; fretted-open 10 is flat unless prefer-open is on, as the scorer
+  reads it, and then it is a wash (+90 / −88 contexts).
+- **Sweet spot low 4 is a Crowley knob.** It hurts in 416 contexts and never helps pooled
+  (Asturias collapses to 4% agreement); on Crowley alone, which sits in the upper
+  positions, it is the single best knob (+8).
+- **The pieces want different things.** Prefer-open is the best second knob on Bach
+  (+11) and on Asturias, and hurts Crowley in 308 contexts (−11 alone). Diagonal span is
+  the strongest mean effect on Bach (+6.7, never hurts) and hurts Crowley in 396 contexts.
+  This is the first measured case for per-idiom profiles rather than one set of defaults:
+  no subset of these ten reaches the three pieces' individual bests at once.
+
+**Crowley by ear** (2026-11-07; scottvr's first verdict from the listening set, with his
+corrected fingering in `runs/m08-2026-11-07/tabs/crowley-organ-scottvr-byhand.tab`). Two
+passages, each repeated once, so eight notes:
+
+1. *Bars 1 and 11, after the D-minor shape at frets 5 to 7:* the melody E3 F3 G3. He plays
+   A string 7, 8, then D string 5, staying in position. The Viterbi defaults play 7, 8, then
+   G3 at A string **10**; the wiki's own command under Viterbi (`--sweet-spot-high 8`) plays
+   all three on the D string at **2, 3, 5** and then jumps back up for the next chord. Both are
+   the scorer avoiding one string switch: a one-string hop costs 10 (symmetric difference,
+   both strings, at 5 each) = 3.3 frets of travel, so a detour of up to three frets to stay
+   on a string wins. The greedy mapper got this bar right by accident (it never looks ahead
+   to the G3). Any exchange rate at or under 2.5 per string, or movement at 6, gives his
+   fingering as the optimum on these bars (16 of 16 notes).
+2. *Bar 9 (and 19), after the C#4/E4 dyad at frets 5 and 6:* F3 E3. The wiki (greedy) tab
+   drops to the D string at 3, 2; he plays A string 8, 7; **every Viterbi setting already
+   plays 8, 7**. From the dyad's mean fret 5.5 the two are an exact tie (2.5 frets, one
+   switch, both in the sweet spot); greedy breaks it by candidate order, Viterbi sees the
+   D chord at 5 to 7 coming. One vote for Viterbi in the greedy-vs-Viterbi pair.
+3. *Not fixed by any knob:* at the end of bar 2 (and 12), before the F chord at frets 1 to 3,
+   every Viterbi setting plays A3 G3 on the G string at 2 and open, diving early; he plays
+   D string 7, 5 and shifts once for the chord. Under the mean-fret model the dive is cheaper
+   by about a point (two short moves beat one long one). Under the index-finger model it is
+   a tie: four frets of shift either way. What separates them is the *count* of shifts, one
+   against two, which no term charges today. That is the "shape change × hand move" factor in
+   scottvr's hand-position note, and the first measured case for a per-shift cost on top of
+   the per-fret one.
+
+Agreement with the wiki tab corrected by his bar-9 fix (168 notes): defaults 144, the wiki
+command 140, string switch 2.5 or 1 or movement 6 all 144, string switch 0 154, sweet spot low
+4 158 (Crowley lives above fret 4). Caveat: `--prefer-open` moves these bars to open position
+(4 of 16 notes agree), which is the Crowley side of the per-idiom split above.
+
+**scottvr's listening verdict on Crowley (2026-11-08):** *end* beats *onset*, and *end* plays
+the same as the wiki command under Viterbi (`crowley-organ-wiki.viterbi-ss8.tab`). The files
+agree with the ear: parsed note for note (168 notes), end and viterbi-ss8 differ in 4 notes,
+the opening E–F of the figure (and its repeat at bar 11) on the A string at frets 7–8 versus
+the D string at frets 2–3, which he rates equivalent to play; blind differs from viterbi-ss8
+in 8 notes (those four plus the G at fret 10 and the B at fret 9, which `--sweet-spot-high 8`
+forbids), onset differs from it in 14. Since Crowley holds every note to the next onset, the
+end base here is a flat ten-fold movement penalty, so the reading is: on this piece a much
+dearer hand move lands where the hand-ceiling knob lands, and the onset base's moderate
+thumb lands somewhere worse than either.
+
+**The open-B bars of Carcassi op. 59 no. 11, in numbers** (2026-11-09, with the new
+`gtrsnipe-research score`). scottvr's one steady disagreement with the classical two-knob set
+(`--prefer-open --sweet-spot-high 4`) on this piece: where the editor plays B3 on the G
+string at fret 4 (leaving the B string free), gtrsnipe plays the open B. Scored as written inside the whole piece, the editor's bars 25 and 26 come to
+−175.5 and −106.5 against gtrsnipe's −103.5 and −71.5, a margin of −107 over the two bars
+(−315 over the piece, 12 notes differ). The margin decomposes as: fretted_open 3 × −20 = −60,
+string_switch 6 × −5 = −30, over_sweet_spot 2 × −5 = −10, move 2 × −3 = −6, in_sweet_spot
+−1, and ringing +3 × 0. No penalty knob can tie it by itself without going negative: the
+editor's choice costs more of everything the scorer charges for. The one knob that can is
+the one it is not charging: the editor's fingering leaves three more strings ringing, and
+`let_ring_bonus` at about 36 would tie the two bars (a lower bound, since the mapper would
+re-optimise; the full sweep found let-ring at 210 drops this piece's agreement from 95% to
+84%). That is the mechanism behind his m. 23 remark: the editor's G:4 is a let-ring choice,
+and gtrsnipe's B:0 is what makes the Fischer edition's "impossible" low F reachable. A
+profile that honours it needs a let-ring weight sized for this idiom, not the Asturias one.
+
+**Agreement by grade, and a direction for defaults vs profiles** (2026-11-07). The defaults'
+agreement with the editors rises with the syllabus level: Preparatory to Level 4, 29 tabs,
+mean 40–47% with a 21–78% spread; Levels 5 to 8, 15 tabs, mean 49–67% with a narrow spread
+(Level 8: 62–69%). Beginner repertoire is written for first position and open strings, which
+is exactly where the defaults go elsewhere; by Level 8 the music forces the hand up the neck
+and editor and mapper solve the same constrained problem. *scottvr's direction from this:* set
+the **defaults** against the upper levels (and the non-pedagogical sample), and serve the lower
+levels with named **profiles** (beginner, intermediate) built from the two-knob fit rather than
+bending the defaults toward first position. Caveat: 15 tabs at Levels 5–8 is thin; the 65
+unchecked candidates in the LaCie manifest would thicken it. Three calibration tabs for his own
+ear (least, median, most agreement) are in `runs/m03-graded-set-2026-11-07/listen/`.
+
+**Still to do in M03** (backlog): shape uncommonness (needs a reference corpus of shapes);
+the graded set (RCM list matched to free tabs); the validation; and then the weights.
+
+## M04: search for an easier tuning
+
+- **Search for an easier tuning than the one assumed** (scottvr, 2026-10-02). Not only "is
+  standard the easiest?" (probably usually), but the specific case of a piece traditionally in
+  an alternate tuning, where some non-traditional tuning might score easier or less complex.
+  - Most pieces exist: F03's `--analyze` already ranks the *named* tunings by the mapper's
+    score; F04's string physics says which tunings a strung guitar can take; the homograph
+    solver already searches per-string retunes.
+  - New: search the space of tunings, not just the list, e.g. each string within a few
+    semitones of the traditional or standard tuning, by local search on the mapper's score,
+    rejecting tunings that overload a string, and charging a little for each retuned string.
+  - Report the traditional tuning's score next to the best found, and say what was gained.
+  - Calibration: "easier" isn't "better". A piece's tuning also sets its drones, ringing open
+    strings and resonance (often the reason it's in that tuning), so the output is an option
+    for a player, not a correction. Pairs with the difficulty measure below and with the
+    optimizer-objectives entry.
+
+## M05: optional notes
+
+- **Optional notes: let the user change *what* gets tabbed, not just where** (scottvr,
+  2026-09-27). Today every sounding pitch must be fingered. If a chord needs a barre, there's
+  no way to ask for a 3-string partial voicing. Players who want partial shapes (beginners,
+  campfire style, funk/rock rhythm) need this, and it is broader than C02 (open voicings).
+  Design notes (Claude):
+  - **Simple knobs:**
+    - `--max-chord-notes N`: keep the top N notes (or the N most essential);
+    - a voicing style: `top3`, shell (root/3rd/7th), power (root/5th);
+    - existing relatives: `--dedupe` and `--mono-lowest-only`.
+  - **Principled version: every note gets a *drop cost* from its musical importance**,
+    and the Viterbi mapper may omit a note when fingering it costs more.
+    - Doubled octaves and 5ths are cheap to drop; 3rds and 7ths are expensive; the melody
+      note is never dropped.
+    - The chord identifier (`gtrsnipe-chords`) already knows which tone is which.
+    - One knob, the drop cost scale, trades faithfulness against ease.
+    - This fits the weights audit's exchange-rate units: "I'd drop a doubled root rather
+      than move 5 frets".
+  - Report what was dropped, the way the homograph report discloses its liberties.
+
+## M06: a hand profile
+
+- **A hand profile: which fingers are available** (scottvr, 2026-10-03). Accessibility, not
+  style: a player missing a fingertip, or who avoids the ring finger for any reason, should get
+  chord shapes and fingerings their hand can make (e.g. `--fingers 1,2,4`, or a profile).
+  - Chord shapes: `open_positions` already counts fretted strings; with a profile it would
+    assign real fingers (index barre allowed or not) and reject shapes needing a missing one.
+  - Tabs: the mapper's span and movement costs assume four fingers; a profile would narrow
+    the playable span and penalize stretches the hand can't make.
+  - A hand *position* state belongs here too (M01 q2, 2026-11-04): open strings are free
+    inside a chord and a trip to the nut inside a line, so an open pedal under a line at
+    the fifth position gets fretted. Not a weight; a knob per case is the road to a profile
+    per song, which scottvr declined.
+  - Natural companions: the "optional notes" entry (top-three voicings, shells, power
+    chords; scottvr's "funk" and, jokingly, "Iommi factor" modes) -- all chosen compromises,
+    each disclosed, never silent.
+
+## M07: simplified "beginner's version" tabs
+
+- **Simplified "beginner's version" tabs** (scottvr, 2026-10-03). The constraints being built
+  for chords (open shapes, a hand profile, optional notes such as top-three voicings) could
+  constrain a whole tab, giving a version of a complex tab that isn't exact but is enough for
+  someone just learning to play.
+  - The same machinery: the mapper with the hand profile's limits; drop costs by musical
+    importance (the "optional notes" entry: keep the melody and the bass, drop doublings and
+    inner voices first); open shapes where chords occur.
+  - Fidelity stays the default, as with `--chart-voicing source`. A simplified tab must say so
+    in its header and list what it changed (notes dropped, octaves moved), the way the
+    homograph report discloses its liberties.
+  - Probably an easy feature once those pieces exist, but it likely depends on the
+    complexity/difficulty measure (below) to know *what* to simplify, and by how much: revisit
+    together with it and the hand profile.

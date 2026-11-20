@@ -1,0 +1,323 @@
+"""Wire the player together: parse -> map -> timeline -> transport -> render.
+
+The Transport (:mod:`gtrsnipe.player.transport`) drives playback; a small Driver
+binds a renderer + a visual Sink + an AudioSink to the Transport's callbacks. All
+I/O is injectable (sink, audio, clock) so the run loop stays unit-testable. The
+CLI entry point (:func:`main`, the ``gtrsnipe-play`` console script) parses a
+file, maps it to the fretboard, and plays it in the terminal.
+"""
+import argparse
+import logging
+import sys
+import time
+from pathlib import Path
+from typing import List, Optional, Sequence
+
+from ..arguments import (
+    add_mapper_args,
+    add_player_args,
+    add_profile_args,
+    add_tab_input_args,
+    adopt_tab_header,
+    add_tuning_args,
+    apply_profiles,
+    build_mapper_config,
+    open_string_pitches_for,
+    resolve_num_strings,
+)
+from ..core.config import MapperConfig
+from ..core.types import Song
+from ..guitar.fingering import positioned
+from ..guitar.mapper import GuitarMapper
+from .audio import AudioSink, NullSink, make_audio_sink
+from .frame import Frame
+from .render.ascii import AsciiFretboardRenderer
+from .render.scrolltab import ScrollingTabRenderer
+from .sink import CursesSink, PlainSink, Sink
+from .timeline import DEFAULT_WINDOW_SIZE, TimelineBuilder
+from .transport import Transport, metronome_timeline
+
+
+logger = logging.getLogger(__name__)
+
+
+class _Driver:
+    """Binds a renderer + visual sink + audio sink to the Transport callbacks."""
+
+    def __init__(self, timeline: Sequence[Frame], renderer, sink: Sink,
+                 audio: AudioSink):
+        self.timeline = timeline
+        self.renderer = renderer
+        self.sink = sink
+        self.audio = audio
+
+    def render(self, beat_time: float) -> None:
+        # Let an interactive sink (curses) drive the renderer's viewport width.
+        w = getattr(self.sink, "width", None)
+        if w and hasattr(self.renderer, "width"):
+            self.renderer.width = w
+        self.sink.write(self.renderer.render_at(self.timeline, beat_time))
+
+    def fire(self, frames: Sequence[Frame]) -> None:
+        pitches = [p for f in frames for p in f.pitches]
+        if all(f.ends for f in frames):
+            self.audio.strike(pitches)      # note ends drive the releases
+        else:
+            self.audio.attack(pitches)      # legacy: each onset replaces the last
+
+    def release(self, pitches: Sequence[int]) -> None:
+        self.audio.release(pitches)
+
+    def silence(self) -> None:
+        self.audio.all_off()
+
+    def read_key(self, blocking: bool) -> Optional[str]:
+        return self.sink.read_key(blocking)
+
+    def show(self, text: str) -> None:
+        self.sink.write(text)  # e.g. the help overlay
+
+
+def parse_and_map(input_path: str, mapper_config: MapperConfig, *,
+                  track: Optional[int] = None,
+                  no_articulations: bool = True, sustain: str = "legato",
+                  refinger: bool = False) -> Song:
+    """Parse an input file and give every note a string and fret: a tab's own, as
+    written, unless ``refinger``; the mapper's for everything else."""
+    # Imported here to avoid a converter<->player import cycle at package load.
+    from ..converter import MusicConverter
+
+    fmt = Path(input_path).suffix.lstrip(".").lower()
+    song = MusicConverter()._parse(
+        input_path, fmt, track,
+        quantization_resolution=mapper_config.quantization_resolution,
+        open_string_pitches=open_string_pitches_for(
+            mapper_config.tuning, getattr(mapper_config, "custom_tuning", None)),
+        sustain=sustain, capo=getattr(mapper_config, "capo", 0) or 0,
+    )
+    song.as_written = fmt == "tab" and not refinger
+    return map_song(song, mapper_config, no_articulations=no_articulations)
+
+
+def build_timeline(song: Song, mapper_config: MapperConfig,
+                   window_size: int = DEFAULT_WINDOW_SIZE, legato: bool = False) -> List[Frame]:
+    return TimelineBuilder(mapper_config, window_size=window_size).build_from_song(
+        song, legato=legato)
+
+
+def build_renderer(cfg: MapperConfig, *, view: str = "fretboard",
+                   orientation: str = "horizontal", handed: str = "right",
+                   width: int = 48):
+    if view == "tab":
+        return ScrollingTabRenderer(cfg, width=width)
+    return AsciiFretboardRenderer(cfg, orientation=orientation, handed=handed)
+
+
+def _beats_per_measure(time_signature: str) -> float:
+    """Quarter-note beats per measure from a "num/den" signature (local copy to
+    avoid a player->chords import cycle)."""
+    try:
+        num, den = (int(x) for x in time_signature.split("/"))
+        return num * (4.0 / den) if num > 0 and den > 0 else 4.0
+    except (ValueError, AttributeError):
+        return 4.0
+
+
+def map_song(song: Song, mapper_config: MapperConfig, *,
+             no_articulations: bool = True) -> Song:
+    """Give every track's events a string and fret, in place (for an already-parsed
+    Song, e.g. one the converter has preprocessed): a tab's own when the song is kept
+    as written, else the mapper's."""
+    mapper = GuitarMapper(mapper_config)
+    for trk in song.tracks:
+        trk.events = positioned(song, trk.events, mapper, no_articulations=no_articulations)
+    return song
+
+
+def run_player(mapped_song: Song, cfg: MapperConfig, *, clock: str = "tempo",
+               tempo: Optional[float] = None, grid_beats: float = 0.5,
+               window_size: int = DEFAULT_WINDOW_SIZE, view: str = "fretboard",
+               orientation: str = "horizontal", handed: str = "right",
+               width: int = 48, fps: float = 12.0,
+               audio: Optional[AudioSink] = None, sink: Optional[Sink] = None,
+               legato: bool = False,
+               now=time.monotonic, sleep=time.sleep) -> int:
+    """Play an already parsed+mapped Song. Returns a process exit code.
+
+    ``clock`` maps to Transport state: ``tempo``/``metronome`` play; ``step``
+    starts paused. ``metronome`` also re-times the timeline to an even grid.
+    """
+    timeline = build_timeline(mapped_song, cfg, window_size=window_size, legato=legato)
+    the_audio = audio or NullSink()
+    the_sink = sink or PlainSink(interactive=True)
+    try:
+        if not timeline:
+            sys.stderr.write("Nothing to play: no notes could be mapped.\n")
+            return 1
+        if clock == "metronome":
+            timeline = metronome_timeline(timeline, grid_beats)
+        renderer = build_renderer(cfg, view=view, orientation=orientation,
+                                  handed=handed, width=width)
+        if hasattr(renderer, "beats_per_measure"):
+            renderer.beats_per_measure = _beats_per_measure(mapped_song.time_signature)
+        driver = _Driver(timeline, renderer, the_sink, the_audio)
+        transport = Transport(timeline, tempo or mapped_song.tempo, fps=fps,
+                              playing=(clock != "step"),
+                              beats_per_measure=_beats_per_measure(mapped_song.time_signature),
+                              now=now, sleep=sleep)
+        the_sink.setup()
+        transport.run(driver)
+        return 0
+    finally:
+        # Restore the terminal even if closing audio raises (e.g. a MIDI port
+        # invalidated by a device unplug), so curses never leaves it corrupted.
+        try:
+            the_audio.close()
+        finally:
+            the_sink.teardown()
+
+
+def run_player_from_args(song: Song, cfg: MapperConfig, args, *,
+                         mapped: bool = False, sink: Optional[Sink] = None,
+                         audio: Optional[AudioSink] = None,
+                         now=time.monotonic, sleep=time.sleep) -> int:
+    """Play a Song using player options read from a parsed args namespace.
+
+    Shared by ``gtrsnipe-play`` and ``gtrsnipe --play``. ``mapped=False`` maps the
+    song first (the converter passes a preprocessed-but-unmapped Song)."""
+    if not mapped:
+        song = map_song(song, cfg)
+    return run_player(
+        song, cfg, clock=args.clock, tempo=args.tempo, grid_beats=args.grid,
+        window_size=args.window, view=args.view, orientation=args.orientation,
+        handed=args.hand, width=args.width, fps=args.fps,
+        audio=audio, sink=sink, legato=getattr(args, "legato", False), now=now, sleep=sleep)
+
+
+def play_file(input_path: str, *, clock: str = "tempo",
+              tempo: Optional[float] = None, grid_beats: float = 0.5,
+              window_size: int = DEFAULT_WINDOW_SIZE, track: Optional[int] = None,
+              mapper_config: Optional[MapperConfig] = None,
+              view: str = "fretboard", orientation: str = "horizontal",
+              handed: str = "right", width: int = 48, fps: float = 12.0,
+              audio: Optional[AudioSink] = None, sink: Optional[Sink] = None,
+              sustain: str = "legato", legato: bool = False,
+              now=time.monotonic, sleep=time.sleep) -> int:
+    """Parse, map, and play a file (thin wrapper over :func:`run_player`)."""
+    cfg = mapper_config or MapperConfig()
+    song = parse_and_map(input_path, cfg, track=track, sustain=sustain)
+    return run_player(
+        song, cfg, clock=clock, tempo=tempo, grid_beats=grid_beats,
+        window_size=window_size, view=view, orientation=orientation, handed=handed,
+        width=width, fps=fps, audio=audio, sink=sink, legato=legato,
+        now=now, sleep=sleep)
+
+
+def instrument_from_song(song: Optional[Song]):
+    """(program, channel, track name) of the first track with notes whose source
+    says which General MIDI program it uses (P03), else None."""
+    for tr in (song.tracks if song else []):
+        if tr.events and tr.program is not None:
+            return tr.program, tr.channel or 0, tr.instrument_name
+    return None
+
+
+def audio_from_args(args, song: Optional[Song] = None) -> AudioSink:
+    """Build the audio sink from parsed args (shared by player & converter --play).
+    Without --instrument, a MIDI source's own program and channel are used."""
+    program, channel = None, 0
+    if args.instrument is None and args.audio != "none":
+        picked = instrument_from_song(song)
+        if picked:
+            program, channel, name = picked
+            from .audio import GM_INSTRUMENTS
+            logger.info(f"Instrument from the file: {GM_INSTRUMENTS[program]} (program "
+                        f"{program}, channel {channel + 1}, track '{name}'); "
+                        "--instrument overrides")
+    return make_audio_sink(args.audio, midi_port=args.midi_port,
+                           soundfont=args.soundfont, instrument=args.instrument,
+                           program=program, channel=channel)
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="gtrsnipe-play",
+        description="Play/visualize a gtrsnipe Song on an ASCII fretboard.",
+    )
+    p.add_argument("input", nargs="?", default=None,
+                   help="Input file (.mid/.abc/.vex/.tab).")
+    p.add_argument("--track", type=int, default=None,
+                   help="For MIDI input: 1-indexed track to play (default: all).")
+    add_tuning_args(p.add_argument_group("Instrument"))
+    add_mapper_args(p.add_argument_group("Mapper (advanced)"))
+    add_player_args(p.add_argument_group("Player"))
+    add_tab_input_args(p.add_argument_group("Tab input"))
+    add_profile_args(p)
+    p.add_argument("--list-instruments", action="store_true",
+                   help="Print the General MIDI instrument names and exit.")
+    return p
+
+
+def _choose_sink(args) -> Sink:
+    """Curses on a real terminal (animated), else a plain stream sink.
+
+    Non-clear/piped/non-TTY output falls back to PlainSink so `printf | ...` and
+    redirects still work.
+    """
+    if sys.stdout.isatty() and not args.no_clear:
+        try:
+            import curses  # noqa: F401  (probe availability; Windows may lack it)
+            return CursesSink(clear=not args.no_clear)
+        except ImportError:
+            pass
+    return PlainSink(clear=not args.no_clear, interactive=True)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = _build_arg_parser()
+    args = apply_profiles(parser, argv)
+
+    if args.list_instruments:
+        from .audio import GM_INSTRUMENTS
+        for i, name in enumerate(GM_INSTRUMENTS):
+            print(f"{i:3}  {name}")
+        return 0
+    if not args.input:
+        parser.error("an input file is required (or use --list-instruments)")
+
+    adopt_tab_header(args, args.input)          # a tab's own tuning and capo, unless you set them
+    cfg = build_mapper_config(
+        args, tuning=args.tuning,
+        num_strings=resolve_num_strings(args.tuning, args.num_strings),
+    )
+    # Parse first, so the audio can default to the file's own instrument (P03).
+    try:
+        song = parse_and_map(args.input, cfg, track=args.track, sustain=args.sustain,
+                         refinger=bool(getattr(args, "refinger", False)))
+    except (OSError, ValueError) as e:
+        sys.stderr.write(f"gtrsnipe-play: can't read {args.input}: {getattr(e, 'strerror', None) or e}\n")
+        return 1
+    try:
+        audio = audio_from_args(args, song)
+    except (RuntimeError, ValueError) as e:
+        sys.stderr.write(f"{e}\n")
+        return 1
+    sink = _choose_sink(args)
+    try:
+        return run_player(
+            song, cfg, clock=args.clock, tempo=args.tempo, grid_beats=args.grid,
+            window_size=args.window, view=args.view, orientation=args.orientation,
+            handed=args.hand, width=args.width, fps=args.fps, audio=audio, sink=sink,
+            legato=args.legato,
+        )
+    except KeyboardInterrupt:  # pragma: no cover - interactive
+        sys.stderr.write("\nStopped.\n")
+        return 130
+    finally:
+        # Release the audio backend even if run_player raised before its own
+        # finally. close() is idempotent.
+        audio.close()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
