@@ -5,9 +5,15 @@ GuitarSet fiziksel zemin gerçeğine (Ground Truth JAMS) karşı 10 parça üzer
 """
 
 import json
+import sys
 from pathlib import Path
 from typing import Dict, List
 import numpy as np
+
+# Proje ana dizinini sys.path'e ekle
+project_root = Path(__file__).resolve().parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
 from evaluation.jams_reader import GuitarSetJamsReader
 from evaluation.fsa_metrics import evaluate_fsa_predictions
