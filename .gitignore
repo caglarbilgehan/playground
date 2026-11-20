@@ -1,0 +1,37 @@
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Large Model Checkpoints & Weights (>100MB GitHub limit)
+*.ckpt
+*.pth
+*.pt
+*.bin
+*.h5
+checkpoints/
+**/checkpoints/
+**/amt/logs/
+**/YourMT3-space/model_output/
+**/YourMT3-space/.git
+
+# IDE & OS Metadata
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.log
+
+# Secrets & Auth
+**/auth2/
+*token*.json
