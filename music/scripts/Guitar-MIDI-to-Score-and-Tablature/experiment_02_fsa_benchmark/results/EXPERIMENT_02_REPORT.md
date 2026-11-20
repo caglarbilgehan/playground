@@ -14,10 +14,10 @@
 
 | Sıra | FSA Motoru | Algoritmik Yaklaşım | Tel Doğruluğu (%) | Perde Doğruluğu (%) | Perde Hatası (MAE) | Ortalama El Atlama |
 | :---: | :--- | :--- | :---: | :---: | :---: | :---: |
-| 🥇 **1** | **gtrsnipe (Biomechanical Viterbi)** | Biomechanical Viterbi | **%61.0** | %61.0 | **1.89 perde** | 1.38 |
-| 🥈 **2** | **GuitarArranger (Fretboard Voicer)** | Fretboard Voicing | **%50.7** | %50.7 | **3.05 perde** | 1.19 |
-| 🥉 **3** | **tuttut (HMM & Graph Viterbi)** | HMM & Graph Theory | **%28.2** | %28.2 | **4.12 perde** | 1.38 |
-|    **4** | **Baseline (Naive Greedy)** | Naive Greedy (Kontrol) | **%27.9** | %27.9 | **4.14 perde** | 1.37 |
+| 🥇 **1** | **gtrsnipe (Biomechanical Viterbi)** | Biomechanical Viterbi | **%61.5** | %61.5 | **1.88 perde** | 1.33 |
+| 🥈 **2** | **GuitarArranger (Fretboard Voicer)** | Fretboard Voicing | **%53.2** | %53.2 | **2.63 perde** | 1.24 |
+| 🥉 **3** | **tuttut (HMM & Graph Viterbi)** | HMM & Graph Theory | **%29.3** | %29.3 | **4.06 perde** | 1.38 |
+|    **4** | **Baseline (Naive Greedy)** | Naive Greedy (Kontrol) | **%27.4** | %27.4 | **4.19 perde** | 1.40 |
 
 ---
 
@@ -25,16 +25,16 @@
 
 | Parça Adı | Tür / Stil | Baseline (Naive) | tuttut | gtrsnipe | GuitarArranger |
 | :--- | :--- | :---: | :---: | :---: | :---: |
-| `05_BN3-119-G_solo` | Bossa Nova (Solo) | %6.5 | %6.5 | **%38.7** | %30.6 |
-| `03_Funk1-97-C_solo` | Funk (Solo) | %24.8 | %25.0 | %29.5 | **%33.3** |
-| `04_Jazz1-200-B_solo` | Jazz (Solo) | %6.2 | %6.2 | **%50.8** | %46.1 |
-| `00_Rock2-142-D_solo` | Rock (Solo) | %56.1 | %56.9 | **%71.5** | %53.9 |
-| `02_SS1-100-C#_solo` | Singer-Songwriter (Solo) | %23.7 | %23.7 | **%74.6** | %44.1 |
-| `04_BN2-131-B_comp` | Bossa Nova (Comping) | %54.9 | %55.3 | %67.0 | **%85.0** |
-| `02_Funk1-97-C_comp` | Funk (Comping) | %71.4 | %71.4 | **%81.0** | %71.4 |
-| `01_Jazz3-150-C_comp` | Jazz (Comping) | %3.5 | %3.5 | **%44.8** | %19.3 |
-| `05_Rock3-117-Bb_comp` | Rock (Comping) | %16.8 | %17.1 | **%89.7** | %55.8 |
-| `00_SS3-84-Bb_comp` | Singer-Songwriter (Comping) | %15.2 | %16.9 | %62.5 | **%67.4** |
+| `05_BN3-119-G_solo` | Bossa Nova (Solo) | %6.7 | %6.7 | %48.3 | **%55.0** |
+| `03_Funk1-97-C_solo` | Funk (Solo) | %24.2 | %24.2 | %35.2 | **%37.4** |
+| `04_Jazz1-200-B_solo` | Jazz (Solo) | %7.1 | %7.1 | **%51.8** | %28.6 |
+| `00_Rock2-142-D_solo` | Rock (Solo) | %59.6 | %61.5 | **%79.8** | %27.9 |
+| `02_SS1-100-C#_solo` | Singer-Songwriter (Solo) | %23.6 | %23.6 | **%72.7** | %43.6 |
+| `04_BN2-131-B_comp` | Bossa Nova (Comping) | %55.4 | %61.5 | %64.1 | **%88.7** |
+| `02_Funk1-97-C_comp` | Funk (Comping) | %71.9 | %71.9 | %73.9 | **%81.0** |
+| `01_Jazz3-150-C_comp` | Jazz (Comping) | %3.1 | %3.9 | **%60.9** | %18.8 |
+| `05_Rock3-117-Bb_comp` | Rock (Comping) | %11.9 | %13.8 | **%72.8** | %72.2 |
+| `00_SS3-84-Bb_comp` | Singer-Songwriter (Comping) | %10.7 | %18.6 | %55.7 | **%79.3** |
 
 ---
 

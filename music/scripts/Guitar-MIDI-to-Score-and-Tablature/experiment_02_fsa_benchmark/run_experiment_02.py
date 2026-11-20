@@ -36,7 +36,7 @@ TEST_TRACKS = [
 def run_experiment_02():
     base_dir = Path(__file__).resolve().parent.parent
     jams_dir = base_dir / "data_sources" / "ground_truth_jams"
-    gt_midi_dir = base_dir / "data_sources" / "ground_truth_midi"
+    amt_midi_dir = base_dir / "data_sources" / "amt_transcribed_midi"
     
     results_dir = base_dir / "experiment_02_fsa_benchmark" / "results"
     preds_dir = base_dir / "experiment_02_fsa_benchmark" / "predictions"
@@ -59,7 +59,7 @@ def run_experiment_02():
 
     for track_name, genre, style in TEST_TRACKS:
         jams_path = jams_dir / f"{track_name}.jams"
-        midi_path = gt_midi_dir / f"{track_name}.mid"
+        midi_path = amt_midi_dir / f"{track_name}_yourmt3.mid"
 
         reader = GuitarSetJamsReader(str(jams_path))
         gt_notes_raw = reader.extract_notes()
